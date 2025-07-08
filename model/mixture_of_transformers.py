@@ -120,29 +120,41 @@ class GQAAttn(nn.Module):
         # ---------- apply per-expert head-dim rescale ----------------------
         # reshape to heads first
         def split_heads(t, n_head, d_head):
-            return t.reshape(B, L, n_head, d_head).transpose(0,2,1,3)
+            return t.reshape(B, L, n_head, d_head).transpose(0,2,1,3) # we transpose here because rope expects (..., L, dim)
 
         q = split_heads(q, H,    d_q)
         k = split_heads(k, H_kv, d_kv)
         v = split_heads(v, H_kv, d_kv)
 
-        # QK norm
-        q_norm = jnp.where(sel[..., None], self.q_norm_gen, self.q_norm_txt)
-        k_norm = jnp.where(sel[..., None], self.k_norm_gen, self.k_norm_txt)
-        q = q * q_norm[..., None]          # match heads broadcast
-        k = k * k_norm[..., None]
-
         # ----------- RoPE (only first 128 dims of each head) --------------
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
 
+        # QK norm, goes after RoPE
+        sel_h = mask_gen[:, None, :, None]                 # (B, 1, L, 1)
+
+        q_scale = jnp.where(
+            sel_h,                                         # broadcast on head axis
+            self.q_norm_gen[None, None, None, :],          # (1,1,1,d_q)
+            self.q_norm_txt[None, None, None, :],
+        )                                                  # (B,1,L,d_q) → broadcast
+
+        k_scale = jnp.where(
+            sel_h,
+            self.k_norm_gen[None, None, None, :],
+            self.k_norm_txt[None, None, None, :],
+        )
+
+        q = q * q_scale                                    # (B, H,    L, d_q)
+        k = k * k_scale                                    # (B, H_kv, L, d_kv)
+
         # ----------- broadcast KV heads to match Q heads (GQA) ------------
         rep = H // H_kv
         k = jnp.repeat(k, rep, axis=1)
-        v = jnp.repeat(v, rep, axis=1)     # shapes (B,16,L,128)
+        v = jnp.repeat(v, rep, axis=1)     # shapes (B,H,L,128)
 
         # ---------- dot-product attention (FLASH fused) -------------------
-        q = q.transpose(0,2,1,3)   # (B,L,H,128) → (B,L,16,128)
+        q = q.transpose(0,2,1,3) # (B,L,H,128)
         k = k.transpose(0,2,1,3)
         v = v.transpose(0,2,1,3)
 
@@ -152,10 +164,10 @@ class GQAAttn(nn.Module):
                 dropout_rate=0.0,
                 deterministic=deterministic,
                 dtype=q.dtype,
-                precision='highest')
+                precision='highest') # highest allows for more stable attention
 
         # ---------- merge heads & expert-specific out-proj -----------------
-        out = out.transpose(0,2,1,3).reshape(B, L, self.hidden)   # (B,L,3584)
+        out = out.reshape(B, L, self.hidden)   # (B,L,3584)
 
         out_txt = self.o_txt(out)
         out_gen = self.o_gen(out)
