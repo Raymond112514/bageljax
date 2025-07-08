@@ -20,6 +20,8 @@ from flax.linen import dot_product_attention
 # -----------------------------------------------------------------
 class RMSNorm(nn.Module):
     eps: float = 1e-6
+
+    @nn.compact
     def __call__(self, x):
         w = self.param("weight", nn.initializers.ones, (x.shape[-1],))
         rms = jnp.sqrt(jnp.mean(x * x, axis=-1, keepdims=True) + self.eps)
