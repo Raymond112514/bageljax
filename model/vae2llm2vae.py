@@ -26,15 +26,36 @@ def ungroup_2x2(z64: jnp.ndarray) -> jnp.ndarray:
     return z.reshape(b, h * 2, w * 2, c // 4)
 
 
-def timestep_embedding(timesteps: jnp.ndarray,
-                       dim: int = 256,
-                       max_period: int = 10_000) -> jnp.ndarray:
-    """Standard sinusoidal time-embedding from diffusion literature."""
-    half  = dim // 2
-    freqs = jnp.exp(-jnp.log(max_period) * jnp.arange(half) / half)
-    args  = timesteps[:, None] * freqs[None]
-    emb   = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
-    return emb.astype(jnp.float32)
+def timestep_embedding(
+    timesteps: jnp.ndarray,
+    dim: int = 256,
+    max_period: int = 10_000,
+) -> jnp.ndarray:
+    """
+    Sinusoidal timestep embedding (float32-only).
+
+    Args:
+        timesteps: 1-D array of shape (N,) with integer or float timesteps.
+        dim:       Embedding dimension (even is recommended).
+        max_period: Controls the minimum frequency.
+
+    Returns:
+        (N, dim) array of float32 embeddings (cosine part first, then sine).
+    """
+    # --- all float32 from here on ------------------------------------------
+    t      = timesteps.astype(jnp.float32)           # (N,)
+    half   = dim // 2
+    half_f = jnp.float32(half)                      # scalar float32
+
+    freqs = jnp.exp(
+        -jnp.log(jnp.float32(max_period))           # scalar float32
+        * jnp.arange(half, dtype=jnp.float32)       # (half,)
+        / half_f
+    )                                               # (half,)
+
+    args = t[:, None] * freqs[None, :]              # (N, half)
+    emb  = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
+    return emb.astype(jnp.float32)                  # (N, dim) float32
 
 
 # ---------------------------------------------------------------------
