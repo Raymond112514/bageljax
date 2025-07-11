@@ -1,6 +1,7 @@
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
 import jax.numpy as jnp
 import flax.linen as nn
+from flax.linen import dot_product_attention
 
 class PatchEmbed(nn.Module):
     """14 × 14 conv-patchifier → (B, L, C)."""
@@ -15,23 +16,43 @@ class PatchEmbed(nn.Module):
                     use_bias=True, name="conv")(x)
         b, h, w, c = x.shape
         return x.reshape(b, h * w, c), (h, w)            # token seq + grid size
-
+    
 class MHA(nn.Module):
+    """Multi-head self-attention (flash/SDPA via `dot_product_attention`)."""
     heads: int = 16
+    dropout_rate: float = 0.0          # keep 0.0 for inference
 
     @nn.compact
-    def __call__(self, x, *, deterministic=True):
-        hidden_dim = x.shape[-1]
-        proj = lambda n: nn.Dense(hidden_dim, use_bias=True, name=n)(x)
-        q, k, v = (proj(n) for n in ['q', 'k', 'v'])
-        b, l, d = q.shape; h = self.heads; d_h = d // h
-        split = lambda t: t.reshape(b, l, h, d_h).transpose(0, 2, 1, 3)
-        q, k, v = map(split, (q, k, v))
-        attn = jnp.einsum('bhld,bhLd->bhlL', q, k) / jnp.sqrt(d_h)
-        attn = nn.softmax(attn, -1)
-        y = jnp.einsum('bhll,bhLd->bhld', attn, v)
-        y = y.transpose(0, 2, 1, 3).reshape(b, l, d)
-        return nn.Dense(hidden_dim, use_bias=True, name='out')(y)
+    def __call__(self,
+                 x: jnp.ndarray,                 # (B, L, D)
+                 *,
+                 deterministic: bool = True,
+                 mask: Optional[jnp.ndarray] = None):
+        B, L, D = x.shape
+        H       = self.heads
+        d_h     = D // H                       # head dim (must divide evenly)
+
+        dense = lambda name: nn.Dense(D, use_bias=True, name=name)
+
+        # -------- QKV projections ----------------------------------------------------
+        q = dense('q')(x).reshape(B, L, H, d_h)
+        k = dense('k')(x).reshape(B, L, H, d_h)
+        v = dense('v')(x).reshape(B, L, H, d_h)
+
+        # -------- (optional) causal / padding mask ----------------------------------
+        # `mask` should already be broadcastable to (B, H, L_q, L_k).
+        y = dot_product_attention(
+                query=q,
+                key=k,
+                value=v,
+                mask=mask,
+                dropout_rate=self.dropout_rate,
+                deterministic=deterministic,
+                precision='highest')           # enables flash/SDPA where available
+
+        # -------- merge heads & output projection -----------------------------------
+        y = y.reshape(B, L, D)
+        return nn.Dense(D, use_bias=True, name='out')(y)
 
 class MLP(nn.Module):
     projection_dim: int = 4304

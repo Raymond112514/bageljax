@@ -31,7 +31,7 @@ class RMSNorm(nn.Module):
 # -----------------------------------------------------------------
 #  Rotary helpers
 # -----------------------------------------------------------------
-def rotary_cache(L: int, dim: int = 128, base: int = 10_000):
+def rotary_cache(L: int, dim: int = 128, base: int = 1_000_000.0):
     freqs  = 1.0 / (base ** (jnp.arange(0, dim, 2) / dim))
     t      = jnp.arange(L)
     angles = t[:, None] * freqs[None, :]
@@ -86,12 +86,11 @@ class GQAAttn(nn.Module):
         self.v_gen = nn.Dense(512,        use_bias=True,  name="gen/v_proj")
         self.o_gen = nn.Dense(self.hidden, use_bias=False, name="gen/o_proj")
 
-        # learned rescalers for Q,K  (shape 128)  – 1 per expert
-        init = nn.initializers.ones
-        self.q_norm_txt = self.param("txt/q_norm", init, (self.rope_dim,))
-        self.k_norm_txt = self.param("txt/k_norm", init, (self.rope_dim,))
-        self.q_norm_gen = self.param("gen/q_norm", init, (self.rope_dim,))
-        self.k_norm_gen = self.param("gen/k_norm", init, (self.rope_dim,))
+        # QK norm parameters
+        self.q_norm_txt = RMSNorm(name="txt/q_norm")
+        self.k_norm_txt = RMSNorm(name="txt/k_norm")
+        self.q_norm_gen = RMSNorm(name="gen/q_norm")
+        self.k_norm_gen = RMSNorm(name="gen/k_norm")
 
     # ---- forward ---------------------------------------------------------
     def __call__(self,
@@ -128,27 +127,24 @@ class GQAAttn(nn.Module):
         k = split_heads(k, H_kv, d_kv)
         v = split_heads(v, H_kv, d_kv)
 
+        # QK norm, goes before RoPE
+        sel_h = mask_gen[:, None, :, None]                 # (B, 1, L, 1)
+
+        q = jnp.where(
+            sel_h,                         
+            self.q_norm_gen(q),
+            self.q_norm_txt(q),
+        )
+
+        k = jnp.where(
+            sel_h,
+            self.k_norm_gen(k),
+            self.k_norm_txt(k),
+        )
+
         # ----------- RoPE (only first 128 dims of each head) --------------
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-
-        # QK norm, goes after RoPE
-        sel_h = mask_gen[:, None, :, None]                 # (B, 1, L, 1)
-
-        q_scale = jnp.where(
-            sel_h,                                         # broadcast on head axis
-            self.q_norm_gen[None, None, None, :],          # (1,1,1,d_q)
-            self.q_norm_txt[None, None, None, :],
-        )                                                  # (B,1,L,d_q) → broadcast
-
-        k_scale = jnp.where(
-            sel_h,
-            self.k_norm_gen[None, None, None, :],
-            self.k_norm_txt[None, None, None, :],
-        )
-
-        q = q * q_scale                                    # (B, H,    L, d_q)
-        k = k * k_scale                                    # (B, H_kv, L, d_kv)
 
         # ----------- broadcast KV heads to match Q heads (GQA) ------------
         rep = H // H_kv
@@ -220,10 +216,12 @@ class MoTBlock(nn.Module):
         # expert-specific post-RMS
         h = jnp.where(mask_gen, self.post_rms_gen(x), self.post_rms_txt(x))
 
-        # expert-specific MLP
-        h_txt = self.mlp_txt(h)
-        h_gen = self.mlp_gen(h)
-        h = jnp.where(mask_gen, h_gen, h_txt)
+        # expert-specific MLP, sparse routing
+        mask_gen_flat = mask_gen.squeeze(-1)
+        h_new = jnp.zeros_like(h)
+        h_new = h_new.at[~mask_gen_flat].set(self.mlp_txt(h[~mask_gen_flat]))
+        h_new = h_new.at[mask_gen_flat].set(self.mlp_gen(h[mask_gen_flat]))
+        h = h_new
 
         return x + h
 
@@ -232,7 +230,7 @@ class MoTBlock(nn.Module):
 #  Full stack (26 layers) + final RMSNorm
 # -----------------------------------------------------------------
 class MixtureOfTransformers(nn.Module):
-    depth:      int = 26
+    depth:      int = 28
     hidden:     int = 3584
     rope_dim:   int = 128
 
