@@ -1,9 +1,3 @@
-"""
-Note the file tokenizer.py under checkpoints is used inexplicably. Make sure to figure this out when porting over to JAX.
-
-I think I figured it out. See https://chatgpt.com/c/687c2c82-12c8-800f-9e78-be1a7fb88bfa
-"""
-
 from bageljax.tokenizer import Qwen2Tokenizer, add_special_tokens
 
 tokenizer_load_path = "pretrained_weights/tokenizer"
