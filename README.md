@@ -1,2 +1,2 @@
-# bagel-jax
+# bageljax
 
