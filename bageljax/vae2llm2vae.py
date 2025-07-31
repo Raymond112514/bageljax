@@ -1,9 +1,5 @@
-# vae2llm2vae.py
-# ---------------------------------------------------------------------
-#  Bridging logic between Flux-style VAE (stride-8, 16-ch) and BAGEL LLM
-# ---------------------------------------------------------------------
 from pathlib import Path
-from typing   import Tuple
+from typing import Tuple
 
 import einops
 import jax, jax.numpy as jnp
@@ -13,9 +9,9 @@ import flax.linen as nn
 def group_2x2(z16: jnp.ndarray) -> jnp.ndarray:
     """(B, H, W, 16) → (B, H/2, W/2, 64)."""
     b, h, w, c = z16.shape
-    z = z16.reshape(b, h // 2, 2, w // 2, 2, c)          # split spatial
-    z = z.transpose(0, 1, 3, 2, 4, 5)                    # move tiles next
-    return z.reshape(b, h // 2, w // 2, 4 * c)           # merge => 64
+    z = z16.reshape(b, h // 2, 2, w // 2, 2, c)    
+    z = z.transpose(0, 1, 3, 2, 4, 5)               
+    return z.reshape(b, h // 2, w // 2, 4 * c)       
 
 
 def ungroup_2x2(z64: jnp.ndarray) -> jnp.ndarray:
@@ -32,11 +28,12 @@ def timestep_embedding(
     max_period: int = 10_000,
 ) -> jnp.ndarray:
     """
-    Sinusoidal timestep embedding (float32-only).
+    Sinusoidal timestep embedding. This happens in float32, and later the embeddings returned
+    will be projected into the LLM dimension, an operation that will happen in bfloat16.
 
     Args:
-        timesteps: 1-D array of shape (N,) with integer or float timesteps.
-        dim:       Embedding dimension (even is recommended).
+        timesteps: 1-D array of shape (N,) with float timesteps.
+        dim:       Embedding dimension.
         max_period: Controls the minimum frequency.
 
     Returns:
@@ -58,26 +55,46 @@ def timestep_embedding(
     return emb.astype(jnp.float32)                  # (N, dim) float32
 
 
-# ---------------------------------------------------------------------
-#  1)  latent tokens → LLM hidden
-# ---------------------------------------------------------------------
+class TimeEmbedder(nn.Module):
+    llm_dim: int = 3584
+    emb_dim: int = 256
+    param_dtype: jnp.dtype = jnp.bfloat16
+
+    def setup(self):
+        self.dense0 = nn.Dense(self.llm_dim,
+                               use_bias=True,
+                               name="mlp/dense0",
+                               dtype=self.param_dtype,
+                               param_dtype=self.param_dtype)
+        self.dense1 = nn.Dense(self.llm_dim,
+                               use_bias=True,
+                               name="mlp/dense1",
+                               dtype=self.param_dtype,
+                               param_dtype=self.param_dtype)
+
+    def __call__(self, timesteps: jnp.ndarray) -> jnp.ndarray:
+        emb = timestep_embedding(timesteps, self.emb_dim)
+        emb = emb.astype(self.param_dtype)  # timestep_embedding func returns float32
+        h = nn.swish(self.dense0(emb))
+        return self.dense1(h)
+
+
 class VAE2LLM(nn.Module):
     """Produces (B, L, 3584) tokens from VAE latents."""
-    max_grid: int = 64          # 64 × 64 = 4096
+    max_grid: int = 64
     llm_dim : int = 3584
+    param_dtype: jnp.dtype = jnp.bfloat16
 
-    # --- parameters ------------------------------------------------------------------
     def setup(self):
-        # learned 2-layer up-projection   64 → 3584
         self.up = nn.Dense(self.llm_dim,
                            use_bias=True,
-                           name="vae2llm")               # (W,b)
-        # absolute position table for 64×64 grid
+                           name="vae2llm",
+                           dtype=self.param_dtype,
+                           param_dtype=self.param_dtype)
         self.pos_embed = self.param("pos_embed",
-                                    nn.initializers.normal(0.02),
+                                    nn.initializers.normal(0.02, dtype=self.param_dtype),
                                     (self.max_grid**2, self.llm_dim))
 
-    # --- forward ----------------------------------------------------------------------
     def __call__(self,
                  z16: jnp.ndarray,
                  ) -> Tuple[jnp.ndarray, Tuple[int, int]]:
@@ -94,36 +111,11 @@ class VAE2LLM(nn.Module):
         return hid, (h, w)                                         # (B,L,3584)
 
 
-# ---------------------------------------------------------------------
-#  2)  Sinusoidal timestep → hidden-dim conditioning
-# ---------------------------------------------------------------------
-class TimeEmbedder(nn.Module):
-    llm_dim: int = 3584
-    emb_dim: int = 256
-
-    def setup(self):
-        self.dense0 = nn.Dense(self.llm_dim,
-                               use_bias=True,
-                               name="mlp/dense0")          # (3584,256)
-        self.dense1 = nn.Dense(self.llm_dim,
-                               use_bias=True,
-                               name="mlp/dense1")          # (3584,3584)
-
-    def __call__(self, timesteps: jnp.ndarray) -> jnp.ndarray:
-        emb = timestep_embedding(timesteps, self.emb_dim)        # (B,256)
-        h   = nn.swish(self.dense0(emb))
-        return self.dense1(h)                                    # (B,3584)
-
-
-# ---------------------------------------------------------------------
-#  3)  LLM hidden → latent grid → decoded RGB
-# ---------------------------------------------------------------------
 class LLM2VAE(nn.Module):
-    max_grid: int = 64          # for reshaping sanity-check
-    llm_dim : int = 3584
+    param_dtype: jnp.dtype = jnp.bfloat16
 
     def setup(self):
-        self.down = nn.Dense(64, use_bias=True, name="llm2vae")  # 3584 → 64
+        self.down = nn.Dense(64, use_bias=True, name="llm2vae", dtype=self.param_dtype, param_dtype=self.param_dtype)  # 3584 → 64
 
     def __call__(self,
                  tokens: jnp.ndarray,
@@ -134,6 +126,8 @@ class LLM2VAE(nn.Module):
         grid_hw: latent grid (h, w) used during encoding
         returns VAE latents
         """
+        tokens = tokens.astype(self.param_dtype)  # ensure correct dtype
+
         b, l, _ = tokens.shape
         h, w    = grid_hw
         assert h * w == l, "grid size does not match token count"
@@ -141,4 +135,4 @@ class LLM2VAE(nn.Module):
         z64 = self.down(tokens)                               # (B,L,64)
         z64 = z64.reshape(b, h, w, 64)                        # grid
         z16 = ungroup_2x2(z64)                                # (B,H*2,W*2,16)
-        return z16
+        return z16.astype(jnp.float32)                        # VAE portion of model operates in float32

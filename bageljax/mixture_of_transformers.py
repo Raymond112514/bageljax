@@ -1,11 +1,3 @@
-# mixture_of_transformers.py
-# ================================================================
-#  Mixture-of-Two Qwen-style Transformer stacks (26 layers, d=3584)
-#  * One common attention operation → full cross-modal interaction
-#  * Two complete *expert* parameter banks (txt  vs  gen/vae)
-#  * GQA: 28 Q-heads (224-d)  /  4 KV-heads (128-d)
-#  * RoPE positional encoding
-# ================================================================
 from __future__ import annotations
 from typing import Optional, Tuple
 
@@ -15,76 +7,99 @@ import flax.linen as nn
 from flax.linen import dot_product_attention
 
 
-# -----------------------------------------------------------------
-#  Norm – RMSNorm (weight only, no bias)
-# -----------------------------------------------------------------
 class RMSNorm(nn.Module):
     eps: float = 1e-6
+    param_dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, x):
-        w = self.param("weight", nn.initializers.ones, (x.shape[-1],))
-        rms = jnp.sqrt(jnp.mean(x * x, axis=-1, keepdims=True) + self.eps)
-        return x * (w / rms)
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        # Make sure activations arrive in bf16
+        x = x.astype(self.param_dtype)
+
+        w = self.param(
+            "weight",
+            nn.initializers.ones(dtype=self.param_dtype),
+            (x.shape[-1],)
+        )
+
+        # Compute 1/√(mean(x²) + ε) in fp32
+        inv_rms = jnp.rsqrt(
+            jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
+            + self.eps
+        ).astype(self.param_dtype) # cast back to bf16
+
+        return x * (w * inv_rms)
 
 
-# -----------------------------------------------------------------
-#  Rotary helpers
-# -----------------------------------------------------------------
-def rotary_cache(L: int, dim: int = 128, base: int = 1_000_000.0):
+def rotary_cache(L: int, dim: int = 128, base: float = 1_000_000.0):
     freqs  = 1.0 / (base ** (jnp.arange(0, dim, 2) / dim))
     t      = jnp.arange(L)
     angles = t[:, None] * freqs[None, :]
-    return jnp.cos(angles), jnp.sin(angles)             # (L,dim//2)
+    return jnp.cos(angles), jnp.sin(angles) # cos/sin caches will be in float32 format
 
-def apply_rope(x: jnp.ndarray, cos: jnp.ndarray, sin: jnp.ndarray):
-    # x shape (..., L, dim)  – dim even and == cos*2
-    x1, x2 = x[..., ::2], x[..., 1::2]
-    rotx1  = x1 * cos - x2 * sin
-    rotx2  = x1 * sin + x2 * cos
-    x_rot  = jnp.stack([rotx1, rotx2], axis=-1).reshape(x.shape)
+
+def apply_rope(
+    x:  jnp.ndarray,        # (B, H, L, D)   – bf16
+    pos: jnp.ndarray,       # (B, L)         – int32 indices
+    cos: jnp.ndarray,       # (max_pos, D//2) fp32
+    sin: jnp.ndarray,       # (max_pos, D//2) fp32
+) -> jnp.ndarray:
+    B, H, L, D = x.shape
+    assert D % 2 == 0, "RoPE requires even last dimension"
+
+    # (B, L, D//2)
+    cos_pos = jnp.take(cos, pos, axis=0).astype(x.dtype)
+    sin_pos = jnp.take(sin, pos, axis=0).astype(x.dtype)
+
+    # Expand to heads: (B, 1, L, D//2) → broadcast to (B, H, L, D//2)
+    cos_pos = cos_pos[:, None, :, :]
+    sin_pos = sin_pos[:, None, :, :]
+
+    x1, x2 = x[..., ::2], x[..., 1::2]           # (B, H, L, D//2) each
+    rotx1  = x1 * cos_pos - x2 * sin_pos
+    rotx2  = x1 * sin_pos + x2 * cos_pos
+
+    # Re‑interleave the two halves back into (B, H, L, D)
+    x_rot = jnp.stack([rotx1, rotx2], axis=-1).reshape(x.shape)
+
     return x_rot
 
 
-# -----------------------------------------------------------------
-#  SwiGLU MLP — duplicated params per expert
-# -----------------------------------------------------------------
 class SwiGLU(nn.Module):
     hidden:  int = 3584
     inner:   int = 18_944
     expert:  str = "txt"     # "txt" | "gen"
+    param_dtype: jnp.dtype = jnp.bfloat16
 
     def setup(self):
-        self.gate = nn.Dense(self.inner, use_bias=False,  name=f"{self.expert}/gate_proj")
-        self.up   = nn.Dense(self.inner, use_bias=False,  name=f"{self.expert}/up_proj")
-        self.down = nn.Dense(self.hidden, use_bias=False, name=f"{self.expert}/down_proj")
+        self.gate = nn.Dense(self.inner, use_bias=False,  name=f"{self.expert}/gate_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
+        self.up   = nn.Dense(self.inner, use_bias=False,  name=f"{self.expert}/up_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
+        self.down = nn.Dense(self.hidden, use_bias=False, name=f"{self.expert}/down_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
 
     def __call__(self, x):                 # (B,L,hidden)
+        x = x.astype(self.param_dtype) # ensure bf16
         return self.down(nn.swish(self.gate(x)) * self.up(x))
 
 
-# -----------------------------------------------------------------
-#  GQA attention with per-token *expert* selection
-# -----------------------------------------------------------------
-class GQAAttn(nn.Module):
+class GQA(nn.Module):
     heads:      int = 28
     kv_heads:   int = 4
     hidden:     int = 3584
     rope_dim:   int = 128
+    param_dtype: jnp.dtype = jnp.bfloat16
 
-    # ---- parameter banks -------------------------------------------------
     def setup(self):
         # txt expert
-        self.q_txt = nn.Dense(self.hidden, use_bias=True,  name="txt/q_proj")
-        self.k_txt = nn.Dense(512,        use_bias=True,  name="txt/k_proj")
-        self.v_txt = nn.Dense(512,        use_bias=True,  name="txt/v_proj")
-        self.o_txt = nn.Dense(self.hidden, use_bias=False, name="txt/o_proj")
+        self.q_txt = nn.Dense(self.hidden, use_bias=True,  name="txt/q_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
+        self.k_txt = nn.Dense(512,        use_bias=True,  name="txt/k_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
+        self.v_txt = nn.Dense(512,        use_bias=True,  name="txt/v_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
+        self.o_txt = nn.Dense(self.hidden, use_bias=False, name="txt/o_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
 
         # gen (VAE) expert
-        self.q_gen = nn.Dense(self.hidden, use_bias=True,  name="gen/q_proj")
-        self.k_gen = nn.Dense(512,        use_bias=True,  name="gen/k_proj")
-        self.v_gen = nn.Dense(512,        use_bias=True,  name="gen/v_proj")
-        self.o_gen = nn.Dense(self.hidden, use_bias=False, name="gen/o_proj")
+        self.q_gen = nn.Dense(self.hidden, use_bias=True,  name="gen/q_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
+        self.k_gen = nn.Dense(512,        use_bias=True,  name="gen/k_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
+        self.v_gen = nn.Dense(512,        use_bias=True,  name="gen/v_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
+        self.o_gen = nn.Dense(self.hidden, use_bias=False, name="gen/o_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
 
         # QK norm parameters
         self.q_norm_txt = RMSNorm(name="txt/q_norm")
@@ -92,15 +107,18 @@ class GQAAttn(nn.Module):
         self.q_norm_gen = RMSNorm(name="gen/q_norm")
         self.k_norm_gen = RMSNorm(name="gen/k_norm")
 
-    # ---- forward ---------------------------------------------------------
     def __call__(self,
                  x: jnp.ndarray,              # (B,L,3584)
                  *,
                  token_types: jnp.ndarray,    # (B,L) 0=pad, 1=text/img, 2=vae
+                 rope_pos_ids: jnp.ndarray,   # (B,L) int32
+                 attn_bias: jnp.ndarray,      # (B,1,L,L)  large-neg where masked
                  cos: jnp.ndarray,
                  sin: jnp.ndarray,
-                 attn_bias: jnp.ndarray,      # (B,1,L,L)  large-neg where masked
-                 deterministic: bool):
+                ):
+        # ensure bf16
+        x = x.astype(self.param_dtype)
+        attn_bias = attn_bias.astype(self.param_dtype)
 
         B, L, _ = x.shape
         H, H_kv = self.heads, self.kv_heads
@@ -118,7 +136,6 @@ class GQAAttn(nn.Module):
         k = jnp.where(sel, k_gen, k_txt)
         v = jnp.where(sel, v_gen, v_txt)
 
-        # ---------- apply per-expert head-dim rescale ----------------------
         # reshape to heads first
         def split_heads(t, n_head, d_head):
             return t.reshape(B, L, n_head, d_head).transpose(0,2,1,3) # we transpose here because rope expects (..., L, dim)
@@ -127,7 +144,7 @@ class GQAAttn(nn.Module):
         k = split_heads(k, H_kv, d_kv)
         v = split_heads(v, H_kv, d_kv)
 
-        # QK norm, goes before RoPE
+        # -------------- QK Norm ----------------------
         sel_h = mask_gen[:, None, :, None]                 # (B, 1, L, 1)
 
         q = jnp.where(
@@ -142,39 +159,38 @@ class GQAAttn(nn.Module):
             self.k_norm_txt(k),
         )
 
-        # ----------- RoPE (only first 128 dims of each head) --------------
-        q = apply_rope(q, cos, sin)
-        k = apply_rope(k, cos, sin)
+        # ----------- RoPE --------------
+        q = apply_rope(q, rope_pos_ids, cos, sin)
+        k = apply_rope(k, rope_pos_ids, cos, sin)
 
         # ----------- broadcast KV heads to match Q heads (GQA) ------------
         rep = H // H_kv
         k = jnp.repeat(k, rep, axis=1)
         v = jnp.repeat(v, rep, axis=1)     # shapes (B,H,L,128)
 
-        # ---------- dot-product attention (FLASH fused) -------------------
+        # ---------- dot-product attention -------------------
         q = q.transpose(0,2,1,3) # (B,L,H,128)
         k = k.transpose(0,2,1,3)
         v = v.transpose(0,2,1,3)
 
         out = dot_product_attention(
-                q, k, v,
-                bias=attn_bias,
-                dropout_rate=0.0,
-                deterministic=deterministic,
-                dtype=q.dtype,
-                precision='highest') # highest allows for more stable attention
+            q, k, v,
+            bias=attn_bias,
+            dropout_rate=0.0,
+            deterministic=True,
+            force_fp32_for_softmax=True,
+        )
 
         # ---------- merge heads & expert-specific out-proj -----------------
         out = out.reshape(B, L, self.hidden)   # (B,L,3584)
+
+        # out might be in float32, but the projections below will convert to bf16 since we specified dtype=bfloat16 in their definitions
 
         out_txt = self.o_txt(out)
         out_gen = self.o_gen(out)
         return jnp.where(sel, out_gen, out_txt)                   # (B,L,3584)
 
 
-# -----------------------------------------------------------------
-#  One *shared-attention* block with expert-specific params
-# -----------------------------------------------------------------
 class MoTBlock(nn.Module):
     hidden: int = 3584
 
@@ -186,19 +202,22 @@ class MoTBlock(nn.Module):
         self.post_rms_gen = RMSNorm(name="gen/post_attn_rms")
 
         # Attention & MLP
-        self.attn = GQAAttn(name="attn")
+        self.attn = GQA(name="attn")
         self.mlp_txt = SwiGLU(expert="txt", name="txt/mlp")
         self.mlp_gen = SwiGLU(expert="gen", name="gen/mlp")
 
-    # ------------------------------------------------------------------
     def __call__(self,
                  x: jnp.ndarray,
                  *,
                  token_types: jnp.ndarray,
+                 rope_pos_ids: jnp.ndarray,
+                 attn_bias: jnp.ndarray,
                  cos: jnp.ndarray,
                  sin: jnp.ndarray,
-                 attn_bias: jnp.ndarray,
-                 deterministic: bool):
+                ):
+        # ensure bf16. Redundant, but let's do it anyway
+        x = x.astype(jnp.bfloat16)
+        attn_bias = attn_bias.astype(jnp.bfloat16)
 
         mask_gen = (token_types == 2)[..., None]          # (B,L,1)
 
@@ -208,27 +227,21 @@ class MoTBlock(nn.Module):
         # shared attention
         h = self.attn(h,
                       token_types=token_types,
-                      cos=cos, sin=sin,
+                      rope_pos_ids=rope_pos_ids,
                       attn_bias=attn_bias,
-                      deterministic=deterministic)
+                      cos=cos, sin=sin,
+                      )
         x = x + h
 
         # expert-specific post-RMS
         h = jnp.where(mask_gen, self.post_rms_gen(x), self.post_rms_txt(x))
 
-        # expert-specific MLP, sparse routing
-        mask_gen_flat = mask_gen.squeeze(-1)
-        h_new = jnp.zeros_like(h)
-        h_new = h_new.at[~mask_gen_flat].set(self.mlp_txt(h[~mask_gen_flat]))
-        h_new = h_new.at[mask_gen_flat].set(self.mlp_gen(h[mask_gen_flat]))
-        h = h_new
+        # expert-specific MLP
+        h = jnp.where(mask_gen, self.mlp_gen(h), self.mlp_txt(h))
 
         return x + h
 
 
-# -----------------------------------------------------------------
-#  Full stack (26 layers) + final RMSNorm
-# -----------------------------------------------------------------
 class MixtureOfTransformers(nn.Module):
     depth:      int = 28
     hidden:     int = 3584
@@ -239,40 +252,29 @@ class MixtureOfTransformers(nn.Module):
         self.out_rms_txt = RMSNorm(name="txt/final_rms")
         self.out_rms_gen = RMSNorm(name="gen/final_rms")
 
-    # ------------------------------------------------------------------
     def __call__(self,
                  x: jnp.ndarray,                  # (B,L,3584)
                  *,
-                 token_types: jnp.ndarray,        # (B,L) 0=pad, 1=text/img, 2=vae
-                 deterministic: bool = True):
+                 token_types: jnp.ndarray,         # (B,L) 0=pad, 1=text/img, 2=vae
+                 rope_pos_ids: jnp.ndarray,
+                 attn_bias: jnp.ndarray,
+                ):     
+        # ensure bf16 (redundant, but let's be sure)
+        x = x.astype(jnp.bfloat16) 
+        attn_bias = attn_bias.astype(jnp.bfloat16)
 
         B, L, _ = x.shape
 
-        # ---- construct attention bias -----------------------------------
-        causal = jnp.tril(jnp.ones((L, L), dtype=bool))
-        is_vae = (token_types == 2)
-        # allow VAE queries to see all VAE keys
-        allowed = jnp.where(is_vae[:, :, None],
-                            causal[None],              # broadcast B
-                            causal[None])
-        allowed = jnp.where(is_vae[:, :, None] & is_vae[:, None, :],
-                    True,
-                    allowed)
-        # padding (token_type==0) sees nothing, and is seen by nothing
-        allowed = jnp.where((token_types[:, :, None] == 0) | (token_types[:, None, :] == 0), False, allowed)
-
-        attn_bias = jnp.where(allowed, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
-
         # ---- RoPE tables -------------------------------------------------
-        cos, sin = rotary_cache(L, self.rope_dim)
+        cos, sin = rotary_cache(L, self.rope_dim)  # these will be in float32
 
         # ---- transformer stack ------------------------------------------
         for blk in self.blocks:
             x = blk(x,
                     token_types=token_types,
-                    cos=cos, sin=sin,
+                    rope_pos_ids=rope_pos_ids,
                     attn_bias=attn_bias,
-                    deterministic=deterministic)
+                    cos=cos, sin=sin)
 
         # ---- final norm per expert --------------------------------------
         mask_gen = (token_types == 2)[..., None]
