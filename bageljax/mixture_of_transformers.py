@@ -1,6 +1,8 @@
 from __future__ import annotations
 from typing import Optional, Tuple
+import functools as ft
 
+import jax
 import jax.numpy as jnp
 import jax.lax   as lax
 import flax.linen as nn
@@ -18,12 +20,12 @@ class RMSNorm(nn.Module):
 
         w = self.param(
             "weight",
-            nn.initializers.ones(dtype=self.param_dtype),
+            ft.partial(nn.initializers.ones, dtype=self.param_dtype),
             (x.shape[-1],)
         )
 
         # Compute 1/√(mean(x²) + ε) in fp32
-        inv_rms = jnp.rsqrt(
+        inv_rms = jax.lax.rsqrt(
             jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
             + self.eps
         ).astype(self.param_dtype) # cast back to bf16
@@ -254,7 +256,6 @@ class MixtureOfTransformers(nn.Module):
 
     def __call__(self,
                  x: jnp.ndarray,                  # (B,L,3584)
-                 *,
                  token_types: jnp.ndarray,         # (B,L) 0=pad, 1=text/img, 2=vae
                  rope_pos_ids: jnp.ndarray,
                  attn_bias: jnp.ndarray,

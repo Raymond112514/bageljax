@@ -99,6 +99,8 @@ class VAE2LLM(nn.Module):
                  z16: jnp.ndarray,
                  ) -> Tuple[jnp.ndarray, Tuple[int, int]]:
         """Returns tokens and latent grid size (h,w)."""
+        z16 = z16.astype(self.param_dtype)  # ensure correct dtype
+
         z64 = group_2x2(z16)                               # (B,H/16,W/16,64)
 
         b, h, w, _ = z64.shape

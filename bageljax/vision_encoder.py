@@ -134,7 +134,7 @@ class ViTConnector(nn.Module):
         idx = jnp.arange(hp)[:, None] * self.max_grid + jnp.arange(wp)[None, :]
         return h + jnp.take(pos_xmodal, idx.reshape(-1), axis=0)
 
-class BagelVisionEncoder(nn.Module):
+class VisionEncoder(nn.Module):
     """NHWC pixels  → patch tokens in LLM space (3584-d)."""
     depth: int = 26
 
