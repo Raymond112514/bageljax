@@ -82,6 +82,9 @@ def init_fn(rng):
 rng = jax.random.PRNGKey(0)
 rng, key = jax.random.split(rng)
 train_state = jax.jit(init_fn)(key)
+print("Model initialized.")
 
 # Load the checkpoint
-checkpoint_path = ...
+checkpoint_path = "pretrained_weights/bagel"
+train_state = checkpoints.restore_checkpoint(checkpoint_path, target=train_state)
+print("Pre-trained weights loaded.")

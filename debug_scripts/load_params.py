@@ -103,7 +103,7 @@ with open("model_params.txt", "w") as f:
     sys.stdout = original_stdout
 
 # Load the pytorch parameters
-pytorch_param_path = "/home/pranav/pytorchbagel/checkpoints/ema.safetensors"
+pytorch_param_path = "/raid/users/pranav/bagel_pytorch_checkpoint/BAGEL-7B-MoT/ema.safetensors"
 pytorch_state_dict = load_sft(pytorch_param_path)
 print("Loaded PyTorch parameters from", pytorch_param_path)
 
