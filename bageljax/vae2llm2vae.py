@@ -137,4 +137,4 @@ class LLM2VAE(nn.Module):
         z64 = self.down(tokens)                               # (B,L,64)
         z64 = z64.reshape(b, h, w, 64)                        # grid
         z16 = ungroup_2x2(z64)                                # (B,H*2,W*2,16)
-        return z16.astype(jnp.float32)                        # VAE portion of model operates in float32
+        return z16
