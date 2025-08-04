@@ -12,6 +12,7 @@ import torch
 from safetensors.torch import load_file as load_sft
 from copy import deepcopy
 import functools
+from functools import partial
 
 from bageljax.vocabulary import TokenEmbedder, LogitsHead
 from bageljax.vision_encoder import VisionEncoder
@@ -151,9 +152,6 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
     # We need to prepare two max length arrays, one with text+vae, the other with just vae, allowing us to do CFG
     # To make CFG easy, we will left-pad
 
-    # The first thing we will do is tokenize the prompt, and the bos and eos tokens, then left pad to max-length - num_vae_tokens
-    # Then we will pass this, alongside the desired image shape (this will be a static parameter) and an rng to a jax.jit wrapped function
-    # which will run the image generation process with batch size 1.
     text_ids = tokenizer.encode(prompt)
     text_ids = [new_token_ids['bos_token_id']] + text_ids + [new_token_ids['eos_token_id']]
 
@@ -161,57 +159,69 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
     text_padding_size = TEXT_2_IMG_MAX_SEQ_LEN - num_vae_tokens - len(text_ids)
     non_padding_text_size = len(text_ids)
     text_ids = [PAD_TOKEN_ID] * text_padding_size + text_ids
+    cfg_text_ids = [PAD_TOKEN_ID] * (text_padding_size + non_padding_text_size)
 
     text_ids = jnp.array(text_ids, dtype=jnp.int32)
-    text_ids_mask = jnp.concatenate([jnp.zeros((text_padding_size,), dtype=bool), jnp.ones((non_padding_text_size,), dtype=bool)])
     text_rope_ids = jnp.concatenate([jnp.zeros((text_padding_size,), dtype=jnp.int32), jnp.arange(non_padding_text_size, dtype=jnp.int32)])
 
-    rng, key = jax.random.split(rng) # update global rng
+    cfg_text_ids = jnp.array(cfg_text_ids, dtype=jnp.int32)
+    cfg_text_rope_ids = jnp.zeros((len(cfg_text_ids),), dtype=jnp.int32)
+
+    token_types = jnp.concatenate([jnp.zeros((text_padding_size,), dtype=jnp.int32), jnp.ones((non_padding_text_size,), dtype=jnp.int32), jnp.ones((1,), dtype=jnp.int32), 2*jnp.ones((num_vae_tokens-2,), dtype=jnp.int32), jnp.ones((1,), dtype=jnp.int32)])
+    cfg_token_types = jnp.concatenate([jnp.zeros((text_padding_size+non_padding_text_size,), dtype=jnp.int32), jnp.ones((1,), dtype=jnp.int32), 2*jnp.ones((num_vae_tokens-2,), dtype=jnp.int32), jnp.ones((1,), dtype=jnp.int32)])
+
+    rng, key = jax.random.split(rng) # use global rng
 
     # So far no batch dimension has been introduced
 
     @partial(jax.jit, static_argnames=("image_shape",))
-    def generate_image(train_state, ae_variables, token_types, text_ids, text_ids_mask, text_rope_ids, rng, image_shape):
-        # none of the function inputs have a batch dimension
+    def generate_image(train_state, token_types, cfg_token_types, text_ids, text_rope_ids, cfg_text_ids, cfg_text_rope_ids, rng, image_shape):
+        # combine text_ids and cfg_text_ids on the batch axis so all computation can be batch parallelized
+        all_text_ids = jnp.stack([text_ids, cfg_text_ids])
 
-        # First we'll embed the text tokens
-        text_embeds = train_state.apply_fn(
+        all_text_embeds = train_state.apply_fn(
             {"params": train_state.params},
-            token_ids=text_ids[None, :],
+            token_ids=all_text_ids,
             train=False,
             name="token_embedder",
         )
-        # text_embeds now has a batch dimension
+        text_embeds = all_text_embeds[0:1] # we'll need this for the CFG-free denoising steps
 
         # Next, we'll sample the VAE latents
         rng, key = jax.random.split(rng)
         x = jax.random.normal(key, (1, image_shape[0] // 8, image_shape[1] // 8, 16), dtype=jnp.bfloat16)
-        # x has a batch dimension
 
         # Sample time in float32
         denoising_timesteps = jnp.linspace(1.0, 0.0, num=50, dtype=jnp.float32)
         timestep_shift = 3.0
         denoising_timesteps = timestep_shift * denoising_timesteps / (1 + (timestep_shift - 1) * denoising_timesteps)
         dts = denoising_timesteps[:-1] - denoising_timesteps[1:]
-        dts = dts[None, ...]
-        # dts has a batch dimension
+
+        # In the PyTorch code base, CFG was only applied when timestep was between 0.4 and 1. 
+        # Based on the (static) value of the time-step shifted denoising_timesteps above, 
+        # this means that we do 41 steps with CFG, and 8 steps without
+        # this is a total of 49 denoising steps, which equals len(dts)
 
         # Let's embed the start and end image tokens
         image_special_token_ids = jnp.array([new_token_ids['start_of_image'], new_token_ids['end_of_image']], dtype=jnp.int32)
-        image_special_embeds = train_state.apply_fn(
+        image_special_token_embeds = train_state.apply_fn(
             {"params": train_state.params},
             token_ids=image_special_token_ids[None, :],
             train=False,
             name="token_embedder",
         )
-        # image_special_embeds has a batch dimension
 
         # Next, prepare the full sequence attention masks, rope ids, and token types
         num_vae_tokens = (image_shape[0] // 16) * (image_shape[1] // 16) + 2
         full_seq_rope_ids = jnp.concatenate([text_rope_ids, jnp.ones((num_vae_tokens,), dtype=jnp.int32) * (text_rope_ids[-1] + 1)], axis=0)[None, :]
+        cfg_full_seq_rope_ids = jnp.concatenate([cfg_text_rope_ids, jnp.zeros((num_vae_tokens,), dtype=jnp.int32)])[None, :]
+        all_full_seq_rope_ids = jnp.concatenate([full_seq_rope_ids, cfg_full_seq_rope_ids], axis=0)
+
         full_seq_token_types = token_types[None, :]  # add batch dimension
+        cfg_full_seq_token_types = cfg_token_types[None, :]
+        all_full_seq_token_types = jnp.concatenate([full_seq_token_types, cfg_full_seq_token_types], axis=0)
     
-        # Attn bias
+        # Now we'll construct the attention bias
         # We will construct an array like token_types, but storing 0 for pad tokens, 1 for causal tokens, and 2 for non-causal tokens
         # It's different because text special tokens in the vae portion are non-causal
         attention_token_types = jnp.concatenate([token_types[:-num_vae_tokens], 2*jnp.ones((num_vae_tokens,), dtype=jnp.int32)], axis=0)[None, :]
@@ -226,14 +236,20 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
                     True,
                     allowed)
         # padding (attention_token_types==0) sees nothing, and is seen by nothing
-        allowed = jnp.where((attention_token_types[:, :, None] == 0) | (attention_token_types[:, None, :] == 0), False, allowed)
+        allowed_attention = jnp.where((attention_token_types[:, :, None] == 0) | (attention_token_types[:, None, :] == 0), False, allowed)
+        full_seq_attn_bias = jnp.where(allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
 
-        attn_bias = jnp.where(allowed, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
+        # Create an attn_bias for the CFG sequence as well. We can reuse a lot of the components
+        cfg_attention_token_types = jnp.concatenate([cfg_token_types[:-num_vae_tokens], 2*jnp.ones((num_vae_tokens,), dtype=jnp.int32)], axis=0)[None, :]
+        # padding (cfg_attention_token_types==0) sees nothing, and is seen by nothing
+        cfg_allowed_attention = jnp.where((cfg_attention_token_types[:, :, None] == 0) | (cfg_attention_token_types[:, None, :] == 0), False, allowed)
+        cfg_full_seq_attn_bias = jnp.where(cfg_allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
+        
+        all_full_seq_attn_bias = jnp.concatenate([full_seq_attn_bias, cfg_full_seq_attn_bias], axis=0)
 
-        # there will be a total of len(dts) == 49 denoising steps
-        def step_fn(carry, _):
+        def step_fn_cfg(carry, _):
             x_t, denoising_t, dts_idx = carry
-            # all three are expected to have a batch dimension
+            # we expect x_t and denoising_t to have a batch dimension, and dts_idx to not
 
             # Ok, now we need to call VAE2LLM
             x_t_embeds, _ = train_state.apply_fn(
@@ -243,18 +259,97 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
                 name="vae2llm",
             )
 
+            # Embed time and add to x_t_embeds
+            time_embedding = train_state.apply_fn(
+                {"params": train_state.params},
+                timesteps=denoising_t,
+                train=False,
+                name="time_embedder",
+            )
+            x_t_embeds = x_t_embeds + time_embedding[:, None, :] # make sure to introduce sequence dimension into time_embedding
+
+            # Concat the special text tokens
+            vae_seq = jnp.concatenate([image_special_token_embeds[:, 0:1, :], x_t_embeds, image_special_token_embeds[:, 1:2, :]], axis=1)
+
+            # Concat the text and vae embeddings
+            # text_embeds, which we will concatenate next line, has batch size 2 (for no cfg and w/ cfg)
+            vae_seq = jnp.tile(vae_seq, (2, 1, 1))
+            full_seq = jnp.concatenate([all_text_embeds, vae_seq], axis=1)
+
+            # Run the mixture of transformers
+            hidden_states = train_state.apply_fn(
+                {"params": train_state.params},
+                x=full_seq,
+                token_types=all_full_seq_token_types,
+                rope_pos_ids=all_full_seq_rope_ids,
+                attn_bias=all_full_seq_attn_bias,
+                train=False,
+                name="mixture_of_transformers",
+            )
+
+            # Now we need to extract just the vae image tokens
+            vae_hidden_states = hidden_states[:, -num_vae_tokens:, :]
+            vae_hidden_states = vae_hidden_states[:, 1:-1, :]  # remove start and end special tokens
+
+            # Project with LLM2VAE
+            v_pred = train_state.apply_fn(
+                {"params": train_state.params},
+                tokens=vae_hidden_states,
+                grid_hw=(image_shape[0] // 16, image_shape[1] // 16),
+                train=False,
+                name="llm2vae",
+            )
+            v_pred, uncond_v_pred = v_pred[0:1], v_pred[1:2]
+
+            # One step of Euler integration with CFG
+            # TODO: figure out shapes of this velocity
+            v = uncond_v_pred + 4.0 * (v_pred - uncond_v_pred)
+            norm_of_cond_v = jnp.linalg.norm(v_pred, axis=-1, keepdims=True)
+            norm_of_v = jnp.linalg.norm(v, axis=-1, keepdims=True)
+            scale = jnp.clip((norm_of_v_no_cfg / (norm_of_v + 1e-8)), min=0.0, max=1.0)
+            v = v * scale
+            dt = jnp.take(dts, dts_idx)
+            x_t = x_t - v * dt
+
+            return {"x_t": x_t, "denoising_t": denoising_t - dt, "dts_idx": dts_idx + 1}
+
+        # We will call this function ~30 times
+        scan_result = jax.lax.scan(step_fn_cfg, {"x_t": x, "denoising_t": jnp.ones((1, 1), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=30)
+        x, denoising_t, dts_idx = scan_result["x_t"], scan_result["denoising_t"], scan_result["dts_idx"]
+
+        def step_fn_no_cfg(carry, _):
+            x_t, denoising_t, dts_idx = carry
+            # x_t and denoising_t have a batch index, dts_idx does not
+
+            # Ok, now we need to call VAE2LLM
+            x_t_embeds, _ = train_state.apply_fn(
+                {"params": train_state.params},
+                z16=x_t,
+                train=False,
+                name="vae2llm",
+            )
+
+            # Embed time and add to x_t_embeds
+            time_embedding = train_state.apply_fn(
+                {"params": train_state.params},
+                timesteps=denoising_t,
+                train=False,
+                name="time_embedder",
+            )
+            x_t_embeds = x_t_embeds + time_embedding
+
             # Concat the special text tokens
             vae_seq = jnp.concatenate([image_special_embeds[:, 0:1, :], x_t_embeds, image_special_embeds[:, 1:2, :]], axis=1)
 
             # Concat the text and vae embeddings
-            full_seq = jnp.concatenate([text_embeds, vae_seq], axis=1)
+            full_seq = jnp.concatenate([regular_text_embeds, vae_seq], axis=1)
 
             # Run the mixture of transformers
             hidden_states = train_state.apply_fn(
                 {"params": train_state.params},
                 x=full_seq,
                 token_types=full_seq_token_types,
-                rope_pos_ids=full_seq_rope_ids,
+                rope_pos_ids=all_full_seq_rope_ids,
                 attn_bias=attn_bias,
                 train=False,
                 name="mixture_of_transformers",
@@ -273,4 +368,26 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
                 name="llm2vae",
             )
 
-            
+            # One step of Euler integration
+            dt = jnp.take(dts, dts_idx)
+            x_t = x_t - v * dt
+
+            return {"x_t": x_t, "denoising_t": denoising_t - dt, "dts_idx": dts_idx + 1}
+
+        # We will call this function the remaining number of times
+        scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": denoising_t, "dts_idx": dts_idx}, xs=None, length=19)
+        x = scan_result["x_t"]
+
+        return x[0] # we don't feed through the vae decoder because that's been jitted separately
+
+    generated_image = generate_image(train_state, ae_variables, token_types, cfg_token_types, text_ids, text_rope_ids, text_ids_cfg, text_cfg_rope_ids, key, image_shape)
+
+    return generated_image # generated latent vae tensor
+
+prompt = "a green lantern"
+gen_img_latent = text2image(prompt)
+gen_img = ae_decode(ae_variables, gen_img_latent)
+gen_img = np.array(gen_img)
+gen_img = Image.fromarray(gen_img)
+
+gen_img.save("a_green_lantern.png")
