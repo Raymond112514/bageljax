@@ -96,12 +96,10 @@ class VAE2LLM(nn.Module):
                                     (self.max_grid**2, self.llm_dim))
 
     def __call__(self,
-                 z16: jnp.ndarray,
+                 z64: jnp.ndarray,
                  ) -> Tuple[jnp.ndarray, Tuple[int, int]]:
         """Returns tokens and latent grid size (h,w)."""
-        z16 = z16.astype(self.param_dtype)  # ensure correct dtype
-
-        z64 = group_2x2(z16)                               # (B,H/16,W/16,64)
+        z64 = z64.astype(self.param_dtype)  # ensure correct dtype
 
         b, h, w, _ = z64.shape
         tokens64 = einops.rearrange(z64, "b h w c -> b (h w) c")  # flatten
@@ -126,7 +124,7 @@ class LLM2VAE(nn.Module):
         """
         tokens : (B, L, 3584)  – from BAGEL image-expert
         grid_hw: latent grid (h, w) used during encoding
-        returns VAE latents
+        returns VAE latents before 2x2 unpatchify
         """
         tokens = tokens.astype(self.param_dtype)  # ensure correct dtype
 
@@ -136,5 +134,4 @@ class LLM2VAE(nn.Module):
 
         z64 = self.down(tokens)                               # (B,L,64)
         z64 = z64.reshape(b, h, w, 64)                        # grid
-        z16 = ungroup_2x2(z64)                                # (B,H*2,W*2,16)
-        return z16
+        return z64
