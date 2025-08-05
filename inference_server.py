@@ -11,6 +11,7 @@ import optax
 from copy import deepcopy
 import functools
 from functools import partial
+from PIL import Image
 
 from bageljax.vocabulary import TokenEmbedder, LogitsHead
 from bageljax.vision_encoder import VisionEncoder
@@ -21,7 +22,7 @@ from bageljax.autoencoder import build_autoencoder
 from bageljax.tokenizer import Qwen2Tokenizer, add_special_tokens
 
 # Set up jax compilation cache
-jax.config.update("jax_compilation_cache_dir", "/home/pranavatreya/.jax_compilation_cache")
+jax.config.update("jax_compilation_cache_dir", "/home/pranav/.jax_compilation_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
@@ -387,7 +388,7 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
         scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": denoising_t, "dts_idx": dts_idx}, xs=None, length=9)
         x = scan_result[0]["x_t"]
 
-        return x[0] # we don't feed through the vae decoder because that's been jitted separately
+        return x # we don't feed through the vae decoder because that's been jitted separately
 
     gen_vae_latents = generate_image(train_state, token_types, cfg_token_types, text_ids, text_rope_ids, cfg_text_ids, cfg_text_rope_ids, key, image_shape)
     return gen_vae_latents.astype(jnp.float32) # The VAE operates in float32
@@ -395,7 +396,7 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
 prompt = "a green lantern"
 gen_img_latent = text2image(prompt)
 gen_img = ae_decode(ae_variables, gen_img_latent)
-gen_img = np.array(gen_img)
+gen_img = np.array(gen_img)[0]
 gen_img = np.clip((gen_img + 1) * 127.5, 0, 255).astype(np.uint8)
 gen_img = Image.fromarray(gen_img)
 
