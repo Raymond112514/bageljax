@@ -393,11 +393,11 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
     gen_vae_latents = generate_image(train_state, token_types, cfg_token_types, text_ids, text_rope_ids, cfg_text_ids, cfg_text_rope_ids, key, image_shape)
     return gen_vae_latents.astype(jnp.float32) # The VAE operates in float32
 
-prompt = "a green lantern"
+prompt = "A female cosplayer portraying an ethereal fairy or elf, wearing a flowing dress made of delicate fabrics in soft, mystical colors like emerald green and silver. She has pointed ears, a gentle, enchanting expression, and her outfit is adorned with sparkling jewels and intricate patterns. The background is a magical forest with glowing plants, mystical creatures, and a serene atmosphere."
 gen_img_latent = text2image(prompt)
 gen_img = ae_decode(ae_variables, gen_img_latent)
 gen_img = np.array(gen_img)[0]
 gen_img = np.clip((gen_img + 1) * 127.5, 0, 255).astype(np.uint8)
 gen_img = Image.fromarray(gen_img)
 
-gen_img.save("a_green_lantern.png")
+gen_img.save("fairy.png")
