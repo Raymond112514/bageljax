@@ -181,7 +181,7 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
 
     # So far no batch dimension has been introduced
 
-    @partial(jax.jit, static_argnames=("image_shape",))
+    #@partial(jax.jit, static_argnames=("image_shape",))
     def generate_image(train_state, token_types, cfg_token_types, text_ids, text_rope_ids, cfg_text_ids, cfg_text_rope_ids, rng, image_shape):
         # combine text_ids and cfg_text_ids on the batch axis so all computation can be batch parallelized
         all_text_ids = jnp.stack([text_ids, cfg_text_ids])
@@ -291,6 +291,8 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
                 name="mixture_of_transformers",
             )
 
+            exit() # for debugging, exit after the transformer forward pass
+
             # Now we need to extract just the vae image tokens
             vae_hidden_states = hidden_states[:, -num_vae_tokens:, :]
             vae_hidden_states = vae_hidden_states[:, 1:-1, :]  # remove start and end special tokens
@@ -323,8 +325,11 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
             return {"x_t": x_t, "denoising_t": denoising_t - dt, "dts_idx": dts_idx + 1}, None
 
         # We will call this function 41 times (see explanation above)
-        scan_result = jax.lax.scan(step_fn_cfg, {"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=41)
-        x, denoising_t, dts_idx = scan_result[0]["x_t"], scan_result[0]["denoising_t"], scan_result[0]["dts_idx"]
+        # scan_result = jax.lax.scan(step_fn_cfg, {"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=41)
+        # x, denoising_t, dts_idx = scan_result[0]["x_t"], scan_result[0]["denoising_t"], scan_result[0]["dts_idx"]
+
+        # For debugging, we will run just 1 denoising step
+        step_fn_cfg({"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, None)
 
         def step_fn_no_cfg(carry, _):
             x_t, denoising_t, dts_idx = carry["x_t"], carry["denoising_t"], carry["dts_idx"]
@@ -384,8 +389,8 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
 
             return {"x_t": x_t, "denoising_t": denoising_t - dt, "dts_idx": dts_idx + 1}, None
 
-        # We will call this function 9 times
-        scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": denoising_t, "dts_idx": dts_idx}, xs=None, length=9)
+        # We will call this function 8 times
+        scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": denoising_t, "dts_idx": dts_idx}, xs=None, length=8)
         x = scan_result[0]["x_t"]
 
         return x # we don't feed through the vae decoder because that's been jitted separately
@@ -395,6 +400,12 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
 
 prompt = "A female cosplayer portraying an ethereal fairy or elf, wearing a flowing dress made of delicate fabrics in soft, mystical colors like emerald green and silver. She has pointed ears, a gentle, enchanting expression, and her outfit is adorned with sparkling jewels and intricate patterns. The background is a magical forest with glowing plants, mystical creatures, and a serene atmosphere."
 gen_img_latent = text2image(prompt)
+
+# print("#" * 30)
+# print(gen_img_latent.shape, gen_img_latent.dtype)
+# print(gen_img_latent)
+# print("#" * 30)
+
 gen_img = ae_decode(ae_variables, gen_img_latent)
 gen_img = np.array(gen_img)[0]
 gen_img = np.clip((gen_img + 1) * 127.5, 0, 255).astype(np.uint8)

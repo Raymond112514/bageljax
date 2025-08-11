@@ -34,37 +34,37 @@ class RMSNorm(nn.Module):
 
 
 def rotary_cache(L: int, dim: int = 128, base: float = 1_000_000.0):
-    freqs  = 1.0 / (base ** (jnp.arange(0, dim, 2) / dim))
-    t      = jnp.arange(L)
-    angles = t[:, None] * freqs[None, :]
-    return jnp.cos(angles), jnp.sin(angles) # cos/sin caches will be in float32 format
-
+    half = dim // 2
+    exponents = jnp.arange(half, dtype=jnp.float32) / half # rope cos and sin should be originated in float32
+    inv_freq = (base ** (-exponents)).astype(jnp.float32)
+    inv_freq_expanded = inv_freq[:, None]
+    max_seq_len_position_ids = jnp.arange(L, dtype=jnp.float32)[None, :]
+    freqs = jnp.matmul(inv_freq_expanded, max_seq_len_position_ids).T
+    emb = jnp.concatenate([freqs, freqs], axis=-1) # (L, dim)
+    return jnp.cos(emb), jnp.sin(emb)
 
 def apply_rope(
-    x:  jnp.ndarray,        # (B, H, L, D)   – bf16
+    x:  jnp.ndarray,        # (B, L, H, D)   – bf16
     pos: jnp.ndarray,       # (B, L)         – int32 indices
-    cos: jnp.ndarray,       # (max_pos, D//2) fp32
-    sin: jnp.ndarray,       # (max_pos, D//2) fp32
+    cos: jnp.ndarray,       # (max_pos, D)   fp32
+    sin: jnp.ndarray,       # (max_pos, D)   fp32
 ) -> jnp.ndarray:
-    B, H, L, D = x.shape
-    assert D % 2 == 0, "RoPE requires even last dimension"
+    # Select from cos, sin according to pos
+    cos, sin = jnp.take(cos, pos, axis=0), jnp.take(sin, pos, axis=0) # each will have resultant shape (B, L, D)
 
-    # (B, L, D//2)
-    cos_pos = jnp.take(cos, pos, axis=0).astype(x.dtype)
-    sin_pos = jnp.take(sin, pos, axis=0).astype(x.dtype)
+    # Add head dim to cos/sin
+    cos, sin = cos[:, :, None, :], sin[:, :, None, :]
 
-    # Expand to heads: (B, 1, L, D//2) → broadcast to (B, H, L, D//2)
-    cos_pos = cos_pos[:, None, :, :]
-    sin_pos = sin_pos[:, None, :, :]
+    # Downcast cos/sin to bfloat16
+    cos, sin = cos.astype(x.dtype), sin.astype(x.dtype)
 
-    x1, x2 = x[..., ::2], x[..., 1::2]           # (B, H, L, D//2) each
-    rotx1  = x1 * cos_pos - x2 * sin_pos
-    rotx2  = x1 * sin_pos + x2 * cos_pos
+    def rotate_half(x):
+        x1 = x[..., :x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return jnp.concatenate([-x2, x1], axis=-1)
 
-    # Re‑interleave the two halves back into (B, H, L, D)
-    x_rot = jnp.stack([rotx1, rotx2], axis=-1).reshape(x.shape)
-
-    return x_rot
+    y = (x * cos) + (rotate_half(x) * sin)
+    return y
 
 
 class SwiGLU(nn.Module):
@@ -140,14 +140,14 @@ class GQA(nn.Module):
 
         # reshape to heads first
         def split_heads(t, n_head, d_head):
-            return t.reshape(B, L, n_head, d_head).transpose(0,2,1,3) # we transpose here because rope expects (..., L, dim)
+            return t.reshape(B, L, n_head, d_head)
 
         q = split_heads(q, H,    d_q)
         k = split_heads(k, H_kv, d_kv)
         v = split_heads(v, H_kv, d_kv)
 
         # -------------- QK Norm ----------------------
-        sel_h = mask_gen[:, None, :, None]                 # (B, 1, L, 1)
+        sel_h = mask_gen[:, :, None, None]                 # (B, L, 1, 1)
 
         q = jnp.where(
             sel_h,                         
@@ -160,21 +160,42 @@ class GQA(nn.Module):
             self.k_norm_gen(k),
             self.k_norm_txt(k),
         )
-
+        
         # ----------- RoPE --------------
         q = apply_rope(q, rope_pos_ids, cos, sin)
         k = apply_rope(k, rope_pos_ids, cos, sin)
 
+        # TMP debugging: print out the keys and values
+        k_debug, v_debug = k[0], v[0]
+        k_debug, v_debug = k_debug[-4174:-4098], v_debug[-4174:-4098]
+        q_debug = q[0][-4174:-4098]
+        if type(k_debug) != jax._src.interpreters.partial_eval.DynamicJaxprTracer:
+            print("#" * 30)
+            # print(f"QUERY.       shape={q_debug.shape}, dtype={q_debug.dtype}")
+            # print(q_debug)
+            # print()
+            print(f"KEY.       shape={k_debug.shape}, dtype={k_debug.dtype}")
+            print(k_debug)
+            print()
+            print(f"VALUE.       shape={v_debug.shape}, dtype={v_debug.dtype}")
+            print(v_debug)
+            print("#" * 30)
+            print()
+
+        #     exit()
+
+        # Ok, now they match even after the RoPE
+
         # ----------- broadcast KV heads to match Q heads (GQA) ------------
         rep = H // H_kv
-        k = jnp.repeat(k, rep, axis=1)
-        v = jnp.repeat(v, rep, axis=1)     # shapes (B,H,L,128)
+        k = jnp.repeat(k, rep, axis=2)
+        v = jnp.repeat(v, rep, axis=2)     # shapes (B,L,H,128)
+
+        # # Let's try a jnp.tile
+        # k = jnp.tile(k, (1, rep, 1, 1))
+        # v = jnp.tile(v, (1, rep, 1, 1))
 
         # ---------- dot-product attention -------------------
-        q = q.transpose(0,2,1,3) # (B,L,H,128)
-        k = k.transpose(0,2,1,3)
-        v = v.transpose(0,2,1,3)
-
         out = dot_product_attention(
             q, k, v,
             bias=attn_bias,
@@ -182,6 +203,23 @@ class GQA(nn.Module):
             deterministic=True,
             force_fp32_for_softmax=True,
         )
+
+        # if type(out) != jax._src.interpreters.partial_eval.DynamicJaxprTracer:
+        #     attn_mask = (attn_bias != -1e30)[0].squeeze(0) # remove batch dimension and head dimension
+        #     print("Saving attention mask as numpy array")
+        #     import numpy as np
+        #     attn_mask = np.array(attn_mask)
+        #     np.save("attn_mask.npy", attn_mask)
+
+        # debugging
+        # out_debug = out[0]
+        # out_debug = out_debug[-4174:-4098]
+        # if type(out_debug) != jax._src.interpreters.partial_eval.DynamicJaxprTracer:
+        #     print("#" * 30)
+        #     print(out_debug.shape, out_debug.dtype)
+        #     print(out_debug)
+        #     print("#" * 30)
+        #     exit()
 
         # ---------- merge heads & expert-specific out-proj -----------------
         out = out.reshape(B, L, self.hidden)   # (B,L,3584)
