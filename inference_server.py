@@ -196,6 +196,7 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
         # Next, we'll sample the VAE latents
         rng, key = jax.random.split(rng)
         x = jax.random.normal(key, (1, image_shape[0] // 8, image_shape[1] // 8, 16), dtype=jnp.bfloat16)
+        #x = jnp.zeros((1, image_shape[0] // 8, image_shape[1] // 8, 16), dtype=jnp.bfloat16) # for debugging purposes we will sample zero noise
 
         # Sample time in float32
         denoising_timesteps = jnp.linspace(1.0, 0.0, num=50, dtype=jnp.float32)
@@ -272,6 +273,11 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
                 name="time_embedder",
             )
             x_t_embeds = x_t_embeds + time_embedding[:, None, :] # make sure to introduce sequence dimension into time_embedding
+            # print("x_t_embeds shape:", x_t_embeds.shape, "x_t_embeds dtype:", x_t_embeds.dtype)
+            # print(x_t_embeds)
+            # exit()
+
+            # Ok nice, so far (in the first denoising step) the x_t_embeds match
 
             # Concat the special text tokens
             vae_seq = jnp.concatenate([image_special_token_embeds[:, 0:1, :], x_t_embeds, image_special_token_embeds[:, 1:2, :]], axis=1)
@@ -291,10 +297,28 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
                 name="mixture_of_transformers",
             )
 
-            exit() # for debugging, exit after the transformer forward pass
+            #exit() # for debugging, exit after the transformer forward pass
 
             # Now we need to extract just the vae image tokens
             vae_hidden_states = hidden_states[:, -num_vae_tokens:, :]
+
+            # print for debugging
+            # vae_hidden_states_0 = vae_hidden_states[0]
+            # print("0th dim vae tensor")
+            # print("vae_hidden_states_0 shape:", vae_hidden_states_0.shape, "vae_hidden_states_0 dtype:", vae_hidden_states_0.dtype)
+            # print(vae_hidden_states_0)
+            # print()
+            # print()
+            # print()
+            # vae_hidden_states_1 = vae_hidden_states[1]
+            # print("vae_hidden_states_1 shape:", vae_hidden_states_1.shape, "vae_hidden_states_1 dtype:", vae_hidden_states_1.dtype)
+            # print("1st dim vae tensor")
+            # print(vae_hidden_states_1)
+            # exit()
+
+            # everything matches at this point, which means our masking is working for the CFG input. And it means that
+            # the error we're facing comes after this point
+
             vae_hidden_states = vae_hidden_states[:, 1:-1, :]  # remove start and end special tokens
 
             # Project with LLM2VAE
@@ -307,6 +331,13 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
             v_pred, uncond_v_pred = v_pred[0:1], v_pred[1:2]
             # these will have shape (B, H, W, 64)
 
+            # Let's print out v_pred to see if the issue is with llm2vae (likely not)
+            # print("v_pred shape:", v_pred.shape, "v_pred dtype:", v_pred.dtype)
+            # print(v_pred)
+            # exit()
+
+            # Ok, I think they match???
+
             # CFG
             v = uncond_v_pred + 4.0 * (v_pred - uncond_v_pred)
             # global norms
@@ -314,6 +345,10 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
             post_cfg_norm = jnp.linalg.norm(v)
             scale = jnp.clip(pre_cfg_norm / (post_cfg_norm + 1e-8), min=0.0, max=1.0)
             v = v * scale
+
+            # print("v shape:", v.shape, "v dtype:", v.dtype)
+            # print(v)
+            # exit()
 
             # 2x2 unpatchify v to make it the same shape as x
             v = ungroup_2x2(v)
@@ -325,11 +360,11 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
             return {"x_t": x_t, "denoising_t": denoising_t - dt, "dts_idx": dts_idx + 1}, None
 
         # We will call this function 41 times (see explanation above)
-        # scan_result = jax.lax.scan(step_fn_cfg, {"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=41)
-        # x, denoising_t, dts_idx = scan_result[0]["x_t"], scan_result[0]["denoising_t"], scan_result[0]["dts_idx"]
+        #scan_result = jax.lax.scan(step_fn_cfg, {"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=49)
+        #x, denoising_t, dts_idx = scan_result[0]["x_t"], scan_result[0]["denoising_t"], scan_result[0]["dts_idx"]
 
         # For debugging, we will run just 1 denoising step
-        step_fn_cfg({"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, None)
+        #step_fn_cfg({"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, None)
 
         def step_fn_no_cfg(carry, _):
             x_t, denoising_t, dts_idx = carry["x_t"], carry["denoising_t"], carry["dts_idx"]
@@ -390,7 +425,9 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
             return {"x_t": x_t, "denoising_t": denoising_t - dt, "dts_idx": dts_idx + 1}, None
 
         # We will call this function 8 times
-        scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": denoising_t, "dts_idx": dts_idx}, xs=None, length=8)
+        #scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": denoising_t, "dts_idx": dts_idx}, xs=None, length=8)
+        #x = scan_result[0]["x_t"]
+        scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=49)
         x = scan_result[0]["x_t"]
 
         return x # we don't feed through the vae decoder because that's been jitted separately

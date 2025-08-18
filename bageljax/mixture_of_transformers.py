@@ -165,22 +165,27 @@ class GQA(nn.Module):
         q = apply_rope(q, rope_pos_ids, cos, sin)
         k = apply_rope(k, rope_pos_ids, cos, sin)
 
-        # TMP debugging: print out the keys and values
-        k_debug, v_debug = k[0], v[0]
-        k_debug, v_debug = k_debug[-4174:-4098], v_debug[-4174:-4098]
-        q_debug = q[0][-4174:-4098]
-        if type(k_debug) != jax._src.interpreters.partial_eval.DynamicJaxprTracer:
-            print("#" * 30)
-            # print(f"QUERY.       shape={q_debug.shape}, dtype={q_debug.dtype}")
-            # print(q_debug)
-            # print()
-            print(f"KEY.       shape={k_debug.shape}, dtype={k_debug.dtype}")
-            print(k_debug)
-            print()
-            print(f"VALUE.       shape={v_debug.shape}, dtype={v_debug.dtype}")
-            print(v_debug)
-            print("#" * 30)
-            print()
+        # # TMP debugging: print out the keys and values
+        # k_debug, v_debug = k[0], v[0]
+
+        # # k_debug, v_debug = k_debug[-4174:-4098], v_debug[-4174:-4098]
+        # # q_debug = q[0][-4174:-4098] ---> the text tokens seem to match now, K, V for sure, probably also Q?
+ 
+        # k_debug, v_debug = k_debug[-4098:], v_debug[-4098:]
+        # q_debug = q[0][-4098:]
+
+        # if type(k_debug) != jax._src.interpreters.partial_eval.DynamicJaxprTracer:
+        #     print("#" * 30)
+        #     # print(f"QUERY.       shape={q_debug.shape}, dtype={q_debug.dtype}")
+        #     # print(q_debug)
+        #     # print()
+        #     print(f"KEY.       shape={k_debug.shape}, dtype={k_debug.dtype}")
+        #     print(k_debug)
+        #     print()
+        #     print(f"VALUE.       shape={v_debug.shape}, dtype={v_debug.dtype}")
+        #     print(v_debug)
+        #     print("#" * 30)
+        #     print()
 
         #     exit()
 
