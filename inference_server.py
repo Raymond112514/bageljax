@@ -360,8 +360,8 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
             return {"x_t": x_t, "denoising_t": denoising_t - dt, "dts_idx": dts_idx + 1}, None
 
         # We will call this function 41 times (see explanation above)
-        #scan_result = jax.lax.scan(step_fn_cfg, {"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=49)
-        #x, denoising_t, dts_idx = scan_result[0]["x_t"], scan_result[0]["denoising_t"], scan_result[0]["dts_idx"]
+        scan_result = jax.lax.scan(step_fn_cfg, {"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=41)
+        x, denoising_t, dts_idx = scan_result[0]["x_t"], scan_result[0]["denoising_t"], scan_result[0]["dts_idx"]
 
         # For debugging, we will run just 1 denoising step
         #step_fn_cfg({"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, None)
@@ -425,10 +425,10 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
             return {"x_t": x_t, "denoising_t": denoising_t - dt, "dts_idx": dts_idx + 1}, None
 
         # We will call this function 8 times
-        #scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": denoising_t, "dts_idx": dts_idx}, xs=None, length=8)
-        #x = scan_result[0]["x_t"]
-        scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=49)
+        scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": denoising_t, "dts_idx": dts_idx}, xs=None, length=8)
         x = scan_result[0]["x_t"]
+        #scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=49)
+        #x = scan_result[0]["x_t"]
 
         return x # we don't feed through the vae decoder because that's been jitted separately
 
