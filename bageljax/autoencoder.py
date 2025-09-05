@@ -33,11 +33,13 @@ class AttnBlock(nn.Module):
         k = einops.rearrange(k, "b h w c -> b 1 (h w) c")
         v = einops.rearrange(v, "b h w c -> b 1 (h w) c")
 
-        scale = 1.0 / jnp.sqrt(self.channels)
+        d_k = jnp.asarray(q.shape[-1], dtype=q.dtype)
+        scale = 1.0 / jnp.sqrt(d_k)
         attn_weights = jnp.einsum("b n q c, b n k c -> b n q k", q, k) * scale
         attn = jax.nn.softmax(attn_weights, axis=-1)
         h_ = jnp.einsum("b n q k, b n k c -> b n q c", attn, v)
-        h_ = einops.rearrange(h_, "b 1 (h w) c -> b h w c", h=x.shape[1])
+        H, W = x.shape[1], x.shape[2]
+        h_ = einops.rearrange(h_, "b 1 (h w) c -> b h w c", h=H, w=W)
 
         h_ = nn.Conv(self.channels, kernel_size=(1, 1))(h_)
         return x + h_

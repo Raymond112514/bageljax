@@ -15,8 +15,8 @@ class RMSNorm(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # Make sure activations arrive in bf16
-        x = x.astype(self.param_dtype)
+        # Record the dtype of the input
+        input_dtype = x.dtype
 
         w = self.param(
             "weight",
@@ -28,7 +28,7 @@ class RMSNorm(nn.Module):
         inv_rms = jax.lax.rsqrt(
             jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
             + self.eps
-        ).astype(self.param_dtype) # cast back to bf16
+        ).astype(input_dtype)
 
         return x * (w * inv_rms)
 
@@ -149,6 +149,7 @@ class GQA(nn.Module):
         # -------------- QK Norm ----------------------
         sel_h = mask_gen[:, :, None, None]                 # (B, L, 1, 1)
 
+        q, k = q.astype(jnp.float32), k.astype(jnp.float32)
         q = jnp.where(
             sel_h,                         
             self.q_norm_gen(q),
@@ -164,6 +165,8 @@ class GQA(nn.Module):
         # ----------- RoPE --------------
         q = apply_rope(q, rope_pos_ids, cos, sin)
         k = apply_rope(k, rope_pos_ids, cos, sin)
+
+        q, k = q.astype(jnp.bfloat16), k.astype(jnp.bfloat16)
 
         # # TMP debugging: print out the keys and values
         # k_debug, v_debug = k[0], v[0]
