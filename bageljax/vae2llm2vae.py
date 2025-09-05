@@ -129,7 +129,7 @@ class LLM2VAE(nn.Module):
         tokens = tokens.astype(self.param_dtype)  # ensure correct dtype
 
         b, l, _ = tokens.shape
-        h, w    = grid_hw
+        h, w = grid_hw
         assert h * w == l, "grid size does not match token count"
 
         z64 = self.down(tokens)                               # (B,L,64)

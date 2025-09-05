@@ -244,7 +244,7 @@ class AutoEncoder(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Convenience factory (weights need separate conversion step)
+# Convenience factory
 # -----------------------------------------------------------------------------
 
 def build_autoencoder(sample_latent: bool = True) -> AutoEncoder:

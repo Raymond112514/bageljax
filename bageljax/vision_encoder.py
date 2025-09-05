@@ -17,7 +17,7 @@ class PatchEmbed(nn.Module):
         x = rearrange(x, 'b hn hp wn wp c -> b hn wn (hp wp c)')
         _, h, w, _ = x.shape
         x = rearrange(x, 'b h w d -> b (h w) d')  # (B, L, C)
-        x = nn.Dense(self.embed_dim, use_bias=True, name='proj', param_dtype=self.param_dtype)(x)
+        x = nn.Dense(self.embed_dim, use_bias=True, name='proj', dtype=self.param_dtype, param_dtype=self.param_dtype)(x)
         return x, (h, w)
     
 class MHA(nn.Module):

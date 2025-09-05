@@ -34,7 +34,6 @@ SEED = 0
 TEXT_2_IMG_MAX_SEQ_LEN = 4350 # max image tokens is 64x64 + 2, a reasonable max prompt tokens is 250 + 2
 PAD_TOKEN_ID = 0 # it doesn't matter what this is
 
-# We will be saving checkpoints in this script, and we want to avoid using orbax
 # Prevent flax.checkpoints from using Orbax backend
 flax.config.update('flax_use_orbax_checkpointing', False)
 
@@ -68,7 +67,7 @@ def init_fn(rng):
                                     jnp.zeros((B, L), dtype=jnp.int32),
                                 ],
                                 vision_encoder = [
-                                    jnp.zeros((B, H, W, 3), dtype=jnp.uint8),
+                                    jnp.zeros((B, H, W, 3), dtype=jnp.uint8), # I think it's better practice to have code assume images are pre-normalized, todo: change
                                 ],
                                 time_embedder = [
                                     jnp.zeros((B,), dtype=jnp.float32),
@@ -132,7 +131,7 @@ def make_jitted_decode(ae):
 
 ae = build_autoencoder(sample_latent=True)
 rng, key = jax.random.split(rng)
-ae_variables = ae.init(key, jnp.zeros((1, 256, 256, 3)))
+ae_variables = ae.init(key, jnp.zeros((1, 1024, 1024, 3)))
 print("Autoencoder initialized.")
 
 # Load weights for the autoencoder
@@ -181,7 +180,7 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
 
     # So far no batch dimension has been introduced
 
-    #@partial(jax.jit, static_argnames=("image_shape",))
+    @partial(jax.jit, static_argnames=("image_shape",))
     def generate_image(train_state, token_types, cfg_token_types, text_ids, text_rope_ids, cfg_text_ids, cfg_text_rope_ids, rng, image_shape):
         # combine text_ids and cfg_text_ids on the batch axis so all computation can be batch parallelized
         all_text_ids = jnp.stack([text_ids, cfg_text_ids])
@@ -195,16 +194,13 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
 
         # Next, we'll sample the VAE latents
         rng, key = jax.random.split(rng)
-        #x = jax.random.normal(key, (1, image_shape[0] // 8, image_shape[1] // 8, 16), dtype=jnp.bfloat16)
-        x = jax.random.normal(key, (1, image_shape[0] // 16, image_shape[1] // 16, 64), dtype=jnp.bfloat16)
-        #x = jnp.zeros((1, image_shape[0] // 8, image_shape[1] // 8, 16), dtype=jnp.bfloat16) # for debugging purposes we will sample zero noise
+        x = jax.random.normal(key, (1, image_shape[0] // 8, image_shape[1] // 8, 16), dtype=jnp.float32) # To match the PyTorch impl, we do Euler integration in float32
 
         # Sample time in float32
         denoising_timesteps = jnp.linspace(1.0, 0.0, num=50, dtype=jnp.float32)
         timestep_shift = 3.0
         denoising_timesteps = timestep_shift * denoising_timesteps / (1 + (timestep_shift - 1) * denoising_timesteps)
         dts = denoising_timesteps[:-1] - denoising_timesteps[1:]
-        dts = dts.astype(jnp.bfloat16) # dts should be in bfloat16, denoising_timesteps in float32
 
         # In the PyTorch code base, CFG was only applied when timestep was between 0.4 and 1. 
         # Based on the (static) value of the time-step shifted denoising_timesteps above, 
@@ -246,12 +242,14 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
         # padding (attention_token_types==0) sees nothing, and is seen by nothing
         allowed_attention = jnp.where((attention_token_types[:, :, None] == 0) | (attention_token_types[:, None, :] == 0), False, allowed)
         full_seq_attn_bias = jnp.where(allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
+        full_seq_attn_bias = full_seq_attn_bias.astype(jnp.bfloat16) # mixed precision is annoying, lol
 
         # Create an attn_bias for the CFG sequence as well. We can reuse a lot of the components
         cfg_attention_token_types = jnp.concatenate([cfg_token_types[:-num_vae_tokens], 2*jnp.ones((num_vae_tokens,), dtype=jnp.int32)], axis=0)[None, :]
         # padding (cfg_attention_token_types==0) sees nothing, and is seen by nothing
         cfg_allowed_attention = jnp.where((cfg_attention_token_types[:, :, None] == 0) | (cfg_attention_token_types[:, None, :] == 0), False, allowed)
         cfg_full_seq_attn_bias = jnp.where(cfg_allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
+        cfg_full_seq_attn_bias = cfg_full_seq_attn_bias.astype(jnp.bfloat16)
         
         all_full_seq_attn_bias = jnp.concatenate([full_seq_attn_bias, cfg_full_seq_attn_bias], axis=0)
 
@@ -260,8 +258,7 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
             # we expect x_t and denoising_t to have a batch dimension, and dts_idx to not (note the batch dimension of denoising_t is its only dimension)
 
             # Ok, now we need to call VAE2LLM
-            #z64 = group_2x2(x_t)
-            z64 = x_t
+            z64 = group_2x2(x_t.astype(jnp.bfloat16))
             x_t_embeds, _ = train_state.apply_fn(
                 {"params": train_state.params},
                 z64=z64,
@@ -275,11 +272,6 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
                 name="time_embedder",
             )
             x_t_embeds = x_t_embeds + time_embedding[:, None, :] # make sure to introduce sequence dimension into time_embedding
-            # print("x_t_embeds shape:", x_t_embeds.shape, "x_t_embeds dtype:", x_t_embeds.dtype)
-            # print(x_t_embeds)
-            # exit()
-
-            # Ok nice, so far (in the first denoising step) the x_t_embeds match
 
             # Concat the special text tokens
             vae_seq = jnp.concatenate([image_special_token_embeds[:, 0:1, :], x_t_embeds, image_special_token_embeds[:, 1:2, :]], axis=1)
@@ -299,28 +291,8 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
                 name="mixture_of_transformers",
             )
 
-            #exit() # for debugging, exit after the transformer forward pass
-
             # Now we need to extract just the vae image tokens
             vae_hidden_states = hidden_states[:, -num_vae_tokens:, :]
-
-            # print for debugging
-            # vae_hidden_states_0 = vae_hidden_states[0]
-            # print("0th dim vae tensor")
-            # print("vae_hidden_states_0 shape:", vae_hidden_states_0.shape, "vae_hidden_states_0 dtype:", vae_hidden_states_0.dtype)
-            # print(vae_hidden_states_0)
-            # print()
-            # print()
-            # print()
-            # vae_hidden_states_1 = vae_hidden_states[1]
-            # print("vae_hidden_states_1 shape:", vae_hidden_states_1.shape, "vae_hidden_states_1 dtype:", vae_hidden_states_1.dtype)
-            # print("1st dim vae tensor")
-            # print(vae_hidden_states_1)
-            # exit()
-
-            # everything matches at this point, which means our masking is working for the CFG input. And it means that
-            # the error we're facing comes after this point
-
             vae_hidden_states = vae_hidden_states[:, 1:-1, :]  # remove start and end special tokens
 
             # Project with LLM2VAE
@@ -330,15 +302,8 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
                 grid_hw=(image_shape[0] // 16, image_shape[1] // 16),
                 name="llm2vae",
             )
+            v_pred = ungroup_2x2(v_pred).astype(jnp.float32) # 2x2 unpatchify, convert to float32 which next few steps require
             v_pred, uncond_v_pred = v_pred[0:1], v_pred[1:2]
-            # these will have shape (B, H, W, 64)
-
-            # Let's print out v_pred to see if the issue is with llm2vae (likely not)
-            # print("v_pred shape:", v_pred.shape, "v_pred dtype:", v_pred.dtype)
-            # print(v_pred)
-            # exit()
-
-            # Ok, I think they match???
 
             # CFG
             v = uncond_v_pred + 4.0 * (v_pred - uncond_v_pred)
@@ -347,13 +312,6 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
             post_cfg_norm = jnp.linalg.norm(v)
             scale = jnp.clip(pre_cfg_norm / (post_cfg_norm + 1e-8), min=0.0, max=1.0)
             v = v * scale
-
-            # print("v shape:", v.shape, "v dtype:", v.dtype)
-            # print(v)
-            # exit()
-
-            # 2x2 unpatchify v to make it the same shape as x
-            #v = ungroup_2x2(v)
 
             # Euler integration
             dt = jnp.take(dts, dts_idx)
@@ -365,16 +323,12 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
         scan_result = jax.lax.scan(step_fn_cfg, {"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=41)
         x, denoising_t, dts_idx = scan_result[0]["x_t"], scan_result[0]["denoising_t"], scan_result[0]["dts_idx"]
 
-        # For debugging, we will run just 1 denoising step
-        #step_fn_cfg({"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, None)
-
         def step_fn_no_cfg(carry, _):
             x_t, denoising_t, dts_idx = carry["x_t"], carry["denoising_t"], carry["dts_idx"]
             # we expect x_t and denoising_t to have a batch dimension, and dts_idx to not (note the batch dimension of denoising_t is its only dimension)
 
             # Ok, now we need to call VAE2LLM
-            #z64 = group_2x2(x_t)
-            z64 = x_t
+            z64 = group_2x2(x_t.astype(jnp.bfloat16))
             x_t_embeds, _ = train_state.apply_fn(
                 {"params": train_state.params},
                 z64=z64,
@@ -416,10 +370,7 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
                 grid_hw=(image_shape[0] // 16, image_shape[1] // 16),
                 name="llm2vae",
             )
-            # this will have shape (B, H, W, 64)
-
-            # 2x2 unpatchify v to make it the same shape as x
-            #v = ungroup_2x2(v)
+            v = ungroup_2x2(v).astype(jnp.float32) # 2x2 unpatchify, convert to float32 which next few steps require
 
             # Euler integration
             dt = jnp.take(dts, dts_idx)
@@ -430,76 +381,19 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
         # We will call this function 8 times
         scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": denoising_t, "dts_idx": dts_idx}, xs=None, length=8)
         x = scan_result[0]["x_t"]
-        #scan_result = jax.lax.scan(step_fn_no_cfg, {"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=49)
-        #x = scan_result[0]["x_t"]
 
-        return x # we don't feed through the vae decoder because that's been jitted separately
+        return x
 
     gen_vae_latents = generate_image(train_state, token_types, cfg_token_types, text_ids, text_rope_ids, cfg_text_ids, cfg_text_rope_ids, key, image_shape)
-    return gen_vae_latents.astype(jnp.float32) # The VAE operates in float32
+    return gen_vae_latents # already in float32
 
-prompt = "A female cosplayer portraying an ethereal fairy or elf, wearing a flowing dress made of delicate fabrics in soft, mystical colors like emerald green and silver. She has pointed ears, a gentle, enchanting expression, and her outfit is adorned with sparkling jewels and intricate patterns. The background is a magical forest with glowing plants, mystical creatures, and a serene atmosphere."
-gen_img_latent = text2image(prompt)
-gen_img_latent = ungroup_2x2(gen_img_latent)
-
-# print("#" * 30)
-# print(gen_img_latent.shape, gen_img_latent.dtype)
-# print(gen_img_latent)
-# print("#" * 30)
-
-
-
-# gen_img_latent_np = np.array(gen_img_latent)
-# np.save("saved_latent.npy", gen_img_latent_np)
-
-
-
-# # Hot swap gen_img_latent with a custom image
-# H, W = 1024, 1024
-# y, x = np.ogrid[:H, :W]
-
-# # Normalize coordinates to [-1, 1] with (0,0) at image center
-# cx = (x - W/2) / (W/2)
-# cy = (y - H/2) / (H/2)
-
-# r = np.hypot(cx, cy)               # radial distance
-# theta = np.arctan2(cy, cx)         # angle
-
-# # HSV components in [0,1]
-# h = (theta + np.pi) / (2 * np.pi)  # hue from angle
-# s = np.clip(r, 0, 1)               # saturation increases with radius
-# v = 0.6 + 0.4 * np.sin(10 * r + 3*np.sin(5*cx) + 3*np.sin(5*cy))
-# v = (v - v.min()) / (v.max() - v.min() + 1e-8)  # normalize
-
-# def hsv_to_rgb(h, s, v):
-#     # h,s,v are 2D arrays in [0,1]
-#     i = (h * 6.0).astype(int) % 6
-#     f = (h * 6.0) - (h * 6.0).astype(int)
-#     p = v * (1.0 - s)
-#     q = v * (1.0 - f * s)
-#     t = v * (1.0 - (1.0 - f) * s)
-#     r = np.choose(i, [v, q, p, p, t, v])
-#     g = np.choose(i, [t, v, v, q, p, p])
-#     b = np.choose(i, [p, p, t, v, v, q])
-#     return np.stack([r, g, b], axis=-1)
-
-# rgb = hsv_to_rgb(h, s, v)
-# img = (np.clip(rgb, 0.0, 1.0) * 255).astype(np.uint8)  # (1024, 1024, 3)
-
-# # Save image to disk so we know what it looks like
-# img_pil = Image.fromarray(img)
-# img_pil.save("colors.png")
-
-
-# img = img[None, ...]
-# img = (img.astype(np.float32) - 127.5) / 127.5
-# gen_img_latent = ae_encode(ae_variables, img, jax.random.PRNGKey(302))
-# print("gen_img_latent shape:", gen_img_latent.shape, "gen_img_latent dtype:", gen_img_latent.dtype)
-
+#prompt = "A female cosplayer portraying an ethereal fairy or elf, wearing a flowing dress made of delicate fabrics in soft, mystical colors like emerald green and silver. She has pointed ears, a gentle, enchanting expression, and her outfit is adorned with sparkling jewels and intricate patterns. The background is a magical forest with glowing plants, mystical creatures, and a serene atmosphere."
+prompt = "Green lantern"
+gen_img_latent = text2image(prompt, (1024, 1024))
 
 gen_img = ae_decode(ae_variables, gen_img_latent)
 gen_img = np.array(gen_img)[0]
 gen_img = np.clip((gen_img + 1) * 127.5, 0, 255).astype(np.uint8)
 gen_img = Image.fromarray(gen_img)
 
-gen_img.save("fairy.png")
+gen_img.save("samples/green_lantern.png")

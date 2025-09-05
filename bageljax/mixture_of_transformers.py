@@ -149,7 +149,6 @@ class GQA(nn.Module):
         # -------------- QK Norm ----------------------
         sel_h = mask_gen[:, :, None, None]                 # (B, L, 1, 1)
 
-        q, k = q.astype(jnp.float32), k.astype(jnp.float32)
         q = jnp.where(
             sel_h,                         
             self.q_norm_gen(q),
@@ -166,42 +165,10 @@ class GQA(nn.Module):
         q = apply_rope(q, rope_pos_ids, cos, sin)
         k = apply_rope(k, rope_pos_ids, cos, sin)
 
-        q, k = q.astype(jnp.bfloat16), k.astype(jnp.bfloat16)
-
-        # # TMP debugging: print out the keys and values
-        # k_debug, v_debug = k[0], v[0]
-
-        # # k_debug, v_debug = k_debug[-4174:-4098], v_debug[-4174:-4098]
-        # # q_debug = q[0][-4174:-4098] ---> the text tokens seem to match now, K, V for sure, probably also Q?
- 
-        # k_debug, v_debug = k_debug[-4098:], v_debug[-4098:]
-        # q_debug = q[0][-4098:]
-
-        # if type(k_debug) != jax._src.interpreters.partial_eval.DynamicJaxprTracer:
-        #     print("#" * 30)
-        #     # print(f"QUERY.       shape={q_debug.shape}, dtype={q_debug.dtype}")
-        #     # print(q_debug)
-        #     # print()
-        #     print(f"KEY.       shape={k_debug.shape}, dtype={k_debug.dtype}")
-        #     print(k_debug)
-        #     print()
-        #     print(f"VALUE.       shape={v_debug.shape}, dtype={v_debug.dtype}")
-        #     print(v_debug)
-        #     print("#" * 30)
-        #     print()
-
-        #     exit()
-
-        # Ok, now they match even after the RoPE
-
         # ----------- broadcast KV heads to match Q heads (GQA) ------------
         rep = H // H_kv
         k = jnp.repeat(k, rep, axis=2)
         v = jnp.repeat(v, rep, axis=2)     # shapes (B,L,H,128)
-
-        # # Let's try a jnp.tile
-        # k = jnp.tile(k, (1, rep, 1, 1))
-        # v = jnp.tile(v, (1, rep, 1, 1))
 
         # ---------- dot-product attention -------------------
         out = dot_product_attention(
@@ -211,23 +178,6 @@ class GQA(nn.Module):
             deterministic=True,
             force_fp32_for_softmax=True,
         )
-
-        # if type(out) != jax._src.interpreters.partial_eval.DynamicJaxprTracer:
-        #     attn_mask = (attn_bias != -1e30)[0].squeeze(0) # remove batch dimension and head dimension
-        #     print("Saving attention mask as numpy array")
-        #     import numpy as np
-        #     attn_mask = np.array(attn_mask)
-        #     np.save("attn_mask.npy", attn_mask)
-
-        # debugging
-        # out_debug = out[0]
-        # out_debug = out_debug[-4174:-4098]
-        # if type(out_debug) != jax._src.interpreters.partial_eval.DynamicJaxprTracer:
-        #     print("#" * 30)
-        #     print(out_debug.shape, out_debug.dtype)
-        #     print(out_debug)
-        #     print("#" * 30)
-        #     exit()
 
         # ---------- merge heads & expert-specific out-proj -----------------
         out = out.reshape(B, L, self.hidden)   # (B,L,3584)
