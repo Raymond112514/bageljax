@@ -388,7 +388,7 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
     return gen_vae_latents # already in float32
 
 #prompt = "A female cosplayer portraying an ethereal fairy or elf, wearing a flowing dress made of delicate fabrics in soft, mystical colors like emerald green and silver. She has pointed ears, a gentle, enchanting expression, and her outfit is adorned with sparkling jewels and intricate patterns. The background is a magical forest with glowing plants, mystical creatures, and a serene atmosphere."
-prompt = "Green lantern"
+prompt = "banana themed billboard that says \"hello world\""
 gen_img_latent = text2image(prompt, (1024, 1024))
 
 gen_img = ae_decode(ae_variables, gen_img_latent)
@@ -396,4 +396,4 @@ gen_img = np.array(gen_img)[0]
 gen_img = np.clip((gen_img + 1) * 127.5, 0, 255).astype(np.uint8)
 gen_img = Image.fromarray(gen_img)
 
-gen_img.save("samples/green_lantern.png")
+gen_img.save("samples/banana_billboard.png")
