@@ -11,8 +11,8 @@ class PatchEmbed(nn.Module):
     param_dtype: jnp.dtype = jnp.bfloat16
 
     @nn.compact
-    def __call__(self, x):
-        x = ((x.astype(jnp.float32) - 127.5) / 127.5).astype(self.param_dtype)   # [-1, 1]
+    def __call__(self, x): # we assume input images are already normalized to [-1, 1]
+        x = x.astype(self.param_dtype) # cast to bfloat16 if not already
         x = rearrange(x, 'b (hn hp) (wn wp) c -> b hn hp wn wp c', hp=self.patch_size, wp=self.patch_size)
         x = rearrange(x, 'b hn hp wn wp c -> b hn wn (hp wp c)')
         _, h, w, _ = x.shape

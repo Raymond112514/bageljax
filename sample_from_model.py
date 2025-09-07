@@ -32,6 +32,7 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 ################################################
 SEED = 0
 TEXT_2_IMG_MAX_SEQ_LEN = 4350 # max image tokens is 64x64 + 2, a reasonable max prompt tokens is 250 + 2
+IMAGE_EDITING_MAX_SEQ_LEN = 13342 # 250 for prompt, 64x64 for vae, another 64x64 for vae conditioning, 70x70 for vit conditioning
 PAD_TOKEN_ID = 0 # it doesn't matter what this is
 
 # Prevent flax.checkpoints from using Orbax backend
@@ -387,13 +388,305 @@ def text2image(prompt: str, image_shape: Tuple[int, int]=(1024, 1024)):
     gen_vae_latents = generate_image(train_state, token_types, cfg_token_types, text_ids, text_rope_ids, cfg_text_ids, cfg_text_rope_ids, key, image_shape)
     return gen_vae_latents # already in float32
 
-#prompt = "A female cosplayer portraying an ethereal fairy or elf, wearing a flowing dress made of delicate fabrics in soft, mystical colors like emerald green and silver. She has pointed ears, a gentle, enchanting expression, and her outfit is adorned with sparkling jewels and intricate patterns. The background is a magical forest with glowing plants, mystical creatures, and a serene atmosphere."
-prompt = "banana themed billboard that says \"hello world\""
-gen_img_latent = text2image(prompt, (1024, 1024))
+################################################
+# Text + Image -> Image inference function
+################################################
+def image_editing(prompt: str, image: Image):
+    global rng # use the global rng
+
+    # We need to prepare three max length arrays, one with everything, one with just text, and one with just image, allowing us to do CFG
+    # The order of the elements is vae context, vit context, text prompt, vae generation
+    # Everything in the above except for text is of fixed size (i.e., we know the size). We have to pad text, so we could (1) keep text at the left 
+    # but adjust rope IDs so that it acts as if it's in the middle, or (2) simply pad in the middle.
+    # I think option (2) is cleaner.
+
+    text_ids = tokenizer.encode(prompt)
+    text_ids = [new_token_ids['bos_token_id']] + text_ids + [new_token_ids['eos_token_id']]
+
+    # Resize the image. Rules: each dimension needs to be a multiple of 14, and needs to be <= 980 pixels so that it can fit through the ViT
+    # each dimension also needs to be a multiple of 16, so that the VAE can process it. Other than these rules, we will also try to resize it 
+    # trying to preserve aspect ratio as much as possible. We will use LANCZOS with anti-alias set to true for downsampling.
+    BASE, MAX_SIDE = 112, 980  # 14 x 16 = 112
+    w, h = image.size
+    scale = min(MAX_SIDE / w, MAX_SIDE / h, 1.0)  # don't exceed 980; avoids unintended upscaling
+    tw, th = int(w * scale), int(h * scale)
+    tw, th = max(BASE, (tw // BASE) * BASE), max(BASE, (th // BASE) * BASE)  # snap down to 112-multiples
+    tw, th = min(tw, MAX_SIDE - (MAX_SIDE % BASE)), min(th, MAX_SIDE - (MAX_SIDE % BASE))  # final clamp
+    image = image.resize((tw, th), resample=Image.LANCZOS)  # LANCZOS automatcially does antialiased downsampling
+
+    # Normalize and convert to tensor
+    image = np.array(image, dtype=np.float32) / 127.5 - 1
+    image_float32 = jnp.array(image, dtype=jnp.float32)
+    image = jnp.array(image, dtype=jnp.bfloat16)
+    image_shape = (image.shape[0], image.shape[1])
+
+    # Pad the text ids, and also prepare useful token sequence length variables
+    num_vae_tokens = (image_shape[0] // 16) * (image_shape[1] // 16) + 2
+    num_vit_tokens = (image_shape[0] // 14) * (image_shape[1] // 14) + 2
+    text_padding_size = IMAGE_EDITING_MAX_SEQ_LEN - 2 * num_vae_tokens - num_vit_tokens - len(text_ids)
+    non_padding_text_size = len(text_ids)
+    num_text_tokens = non_padding_text_size + text_padding_size
+    text_ids = [PAD_TOKEN_ID] * text_padding_size + text_ids
+    text_ids = jnp.array(text_ids, dtype=jnp.int32)
+    
+    # Next construct rope id arrays for all three sequences
+    rope_ids = jnp.concatenate([
+        0 * jnp.ones((num_vae_tokens,), dtype=jnp.int32),
+        1 * jnp.ones((num_vit_tokens,), dtype=jnp.int32),
+        jnp.concatenate([jnp.zeros((text_padding_size,), dtype=jnp.int32), 2 + jnp.arange(non_padding_text_size, dtype=jnp.int32)]), # note: the rope id for padding doesn't matter
+        (non_padding_text_size + 2) * jnp.ones((num_vae_tokens,), dtype=jnp.int32),
+    ])
+    cfg_text_rope_ids = jnp.concatenate([
+        0 * jnp.ones((num_vae_tokens,), dtype=jnp.int32),
+        1 * jnp.ones((num_vit_tokens,), dtype=jnp.int32),
+        jnp.zeros((num_text_tokens,), dtype=jnp.int32), # note: the rope id for padding doesn't matter
+        2 * jnp.ones((num_vae_tokens,), dtype=jnp.int32),
+    ])
+    cfg_image_rope_ids = jnp.concatenate([
+        0 * jnp.ones((num_vae_tokens,), dtype=jnp.int32), # note: the rope id for padding doesn't matter
+        0 * jnp.ones((num_vit_tokens,), dtype=jnp.int32), # note: the rope id for padding doesn't matter
+        jnp.concatenate([jnp.zeros((text_padding_size,), dtype=jnp.int32), jnp.arange(non_padding_text_size, dtype=jnp.int32)]), # note: the rope id for padding doesn't matter
+        non_padding_text_size * jnp.ones((num_vae_tokens,), dtype=jnp.int32),
+    ])
+    
+    # Next, construct the token types arrays for all three sequences. Remember, 0 is for padding, 1 is for text/vit, and 2 is for vae
+    token_types = jnp.concatenate([
+        jnp.concatenate([jnp.ones((1,), dtype=jnp.int32), 2 * jnp.ones((num_vae_tokens-2), dtype=jnp.int32), jnp.ones((1,), dtype=jnp.int32)]),
+        1 * jnp.ones((num_vit_tokens,), dtype=jnp.int32),
+        jnp.concatenate([jnp.zeros((text_padding_size,), dtype=jnp.int32), 1 * jnp.ones((non_padding_text_size,), dtype=jnp.int32)]),
+        jnp.concatenate([jnp.ones((1,), dtype=jnp.int32), 2 * jnp.ones((num_vae_tokens-2), dtype=jnp.int32), jnp.ones((1,), dtype=jnp.int32)]),
+    ])
+    cfg_text_token_types = jnp.concatenate([
+        jnp.concatenate([jnp.ones((1,), dtype=jnp.int32), 2 * jnp.ones((num_vae_tokens-2), dtype=jnp.int32), jnp.ones((1,), dtype=jnp.int32)]),
+        1 * jnp.ones((num_vit_tokens,), dtype=jnp.int32),
+        jnp.zeros((num_text_tokens,), dtype=jnp.int32),
+        jnp.concatenate([jnp.ones((1,), dtype=jnp.int32), 2 * jnp.ones((num_vae_tokens-2), dtype=jnp.int32), jnp.ones((1,), dtype=jnp.int32)]),
+    ])
+    cfg_image_token_types = jnp.concatenate([
+        jnp.zeros((num_vae_tokens,), dtype=jnp.int32),
+        jnp.zeros((num_vit_tokens,), dtype=jnp.int32),
+        jnp.concatenate([jnp.zeros((text_padding_size,), dtype=jnp.int32), 1 * jnp.ones((non_padding_text_size,), dtype=jnp.int32)]),
+        jnp.concatenate([jnp.ones((1,), dtype=jnp.int32), 2 * jnp.ones((num_vae_tokens-2), dtype=jnp.int32), jnp.ones((1,), dtype=jnp.int32)]),
+    ])
+
+    # The ViT can process the raw image, but the VAE (when used for image conditioning) needs VAE latents
+    rng, key = jax.random.split(rng) # split from the global rng which we have captured
+    image_latents = ae_encode(ae_variables, image_float32[None, ...], key)
+    image_latents = image_latents[0] # remove batch dim for consistency with all other vars so far, which don't have a batch dim yet
+    image_latents = image_latents.astype(jnp.bfloat16)
+
+    rng, key = jax.random.split(rng) # use global rng for following call of generate_image
+
+    # So far no batch dimension has been introduced
+
+    @partial(jax.jit, static_argnames=("image_shape",))
+    def generate_image(train_state, text_ids, image, image_latents, image_shape, token_types, cfg_text_token_types, cfg_image_token_types, rope_ids, cfg_text_rope_ids, cfg_image_rope_ids, rng):
+        # Let's embed the start and end image tokens
+        image_special_token_ids = jnp.array([new_token_ids['start_of_image'], new_token_ids['end_of_image']], dtype=jnp.int32)
+        image_special_token_embeds = train_state.apply_fn(
+            {"params": train_state.params},
+            token_ids=image_special_token_ids[None, :],
+            name="token_embedder",
+        )
+
+        # Next, prepare part of token sequence corresponding to the VAE conditioning
+        timestep_zero = jnp.zeros((1,), dtype=jnp.float32)
+        timestep_zero_embedding = train_state.apply_fn(
+            {"params": train_state.params},
+            timesteps=timestep_zero,
+            name="time_embedder",
+        ) # will be of shape (1, hidden_dim), dtype bfloat16
+        assert timestep_zero_embedding.ndim == 2
+        pre_llm_image_latents = group_2x2(image_latents[None, ...]) # Will have shape (B, H // 16, W // 16, 64)
+        pre_llm_image_latents, _ = train_state.apply_fn(
+            {"params": train_state.params},
+            z64=pre_llm_image_latents,
+            name="vae2llm",
+        )
+        pre_llm_image_latents = pre_llm_image_latents + timestep_zero_embedding[:, None, :]
+        pre_llm_image_latents = jnp.concatenate([image_special_token_embeds[:, 0:1], pre_llm_image_latents, image_special_token_embeds[:, 1:2]], axis=1) # add the special image tokens
+        # Copy three times along batch dimension
+        pre_llm_image_latents = jnp.concatenate([pre_llm_image_latents, pre_llm_image_latents, pre_llm_image_latents], axis=0)
+
+        # Similarly, prepare part of token sequence corresponding to the ViT tokens
+        pre_llm_vit_tokens = train_state.apply_fn(
+            {"params": train_state.params},
+            img=image[None, ...],
+            name="vision_encoder",
+        ) # will have shape (B, num_vit_tokens, llm_hidden_dim)
+        pre_llm_vit_tokens = jnp.concatenate([image_special_token_embeds[:, 0:1], pre_llm_vit_tokens, image_special_token_embeds[:, 1:2]], axis=1) # add the special image tokens
+        # Copy three times along batch dimension
+        pre_llm_vit_tokens = jnp.concatenate([pre_llm_vit_tokens, pre_llm_vit_tokens, pre_llm_vit_tokens], axis=0)
+
+        # Next, the text tokens
+        text_embeds = train_state.apply_fn(
+            {"params": train_state.params},
+            token_ids=text_ids[None, ...],
+            name="token_embedder",
+        )
+        # Copy three times along batch dimension
+        text_embeds = jnp.concatenate([text_embeds, text_embeds, text_embeds], axis=0)
+
+        # Next, we'll sample the VAE latents
+        rng, key = jax.random.split(rng)
+        x = jax.random.normal(key, (1, image_shape[0] // 8, image_shape[1] // 8, 16), dtype=jnp.float32) # To match the PyTorch impl, we do Euler integration in float32
+
+        # Sample time in float32
+        denoising_timesteps = jnp.linspace(1.0, 0.0, num=50, dtype=jnp.float32)
+        timestep_shift = 3.0
+        denoising_timesteps = timestep_shift * denoising_timesteps / (1 + (timestep_shift - 1) * denoising_timesteps)
+        dts = denoising_timesteps[:-1] - denoising_timesteps[1:]
+
+        # In the PyTorch code base, CFG is applied for all timesteps. So 49 denoising steps, all with CFG
+    
+        # Now we'll construct the attention bias, which will be block-wise causal
+        L = IMAGE_EDITING_MAX_SEQ_LEN
+        # Start with a causal mask
+        causal = jnp.tril(jnp.ones((L, L), dtype=bool))
+        num_vae_tokens = pre_llm_image_latents.shape[1]
+        num_vit_tokens = pre_llm_vit_tokens.shape[1]
+        num_text_tokens = text_ids.shape[0]
+        # block-wise self-attention
+        row1_mask = jnp.concatenate([jnp.ones((num_vae_tokens, num_vae_tokens), dtype=bool), jnp.zeros((num_vae_tokens, L-num_vae_tokens), dtype=bool)], axis=1)
+        row2_mask = jnp.concatenate([jnp.ones((num_vit_tokens, num_vae_tokens + num_vit_tokens), dtype=bool), jnp.zeros((num_vit_tokens, L - num_vit_tokens - num_vae_tokens), dtype=bool)], axis=1)
+        row3_mask = jnp.zeros((num_text_tokens, L), dtype=bool)
+        row4_mask = jnp.ones((num_vae_tokens, L), dtype=bool)
+        blockwise_mask = jnp.concatenate([row1_mask, row2_mask, row3_mask, row4_mask], axis=0)
+        blockwise_causal_or_causal = blockwise_mask | causal
+        # padding sees nothing, and is seen by nothing
+        padding = token_types[None, :] == 0
+        allowed_attention = jnp.where(padding[:, :, None] | padding[:, None, :], False, blockwise_causal_or_causal)
+        attn_bias = jnp.where(allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
+        attn_bias = attn_bias.astype(jnp.bfloat16) # mixed precision is annoying, lol
+
+        # Create an attn_bias for the CFG sequences as well. We can reuse a lot of the components
+        # Let's start with text CFG
+        cfg_text_padding = cfg_text_token_types[None, :] == 0
+        allowed_attention = jnp.where(cfg_text_padding[:, :, None] | cfg_text_padding[:, None, :], False, blockwise_causal_or_causal)
+        cfg_text_attn_bias = jnp.where(allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
+        cfg_text_attn_bias = cfg_text_attn_bias.astype(jnp.bfloat16) # mixed precision is annoying, lol
+
+        # And image CFG
+        cfg_image_padding = cfg_image_token_types[None, :] == 0
+        allowed_attention = jnp.where(cfg_image_padding[:, :, None] | cfg_image_padding[:, None, :], False, blockwise_causal_or_causal)
+        cfg_image_attn_bias = jnp.where(allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
+        cfg_image_attn_bias = cfg_image_attn_bias.astype(jnp.bfloat16) # mixed precision is annoying, lol
+        
+        all_attn_biases = jnp.concatenate([attn_bias, cfg_text_attn_bias, cfg_image_attn_bias], axis=0)
+
+        # Also concatenate rope ids and token types along the batch dimension for the 3 sequences
+        all_rope_ids = jnp.stack([rope_ids, cfg_text_rope_ids, cfg_image_rope_ids], axis=0)
+        all_token_types = jnp.stack([token_types, cfg_text_token_types, cfg_image_token_types], axis=0)
+
+        def step_fn_cfg(carry, _):
+            x_t, denoising_t, dts_idx = carry["x_t"], carry["denoising_t"], carry["dts_idx"]
+            # we expect x_t and denoising_t to have a batch dimension, and dts_idx to not (note the batch dimension of denoising_t is its only dimension)
+
+            # Ok, now we need to call VAE2LLM
+            z64 = group_2x2(x_t.astype(jnp.bfloat16))
+            x_t_embeds, _ = train_state.apply_fn(
+                {"params": train_state.params},
+                z64=z64,
+                name="vae2llm",
+            )
+
+            # Embed time and add to x_t_embeds
+            time_embedding = train_state.apply_fn(
+                {"params": train_state.params},
+                timesteps=denoising_t,
+                name="time_embedder",
+            )
+            x_t_embeds = x_t_embeds + time_embedding[:, None, :] # make sure to introduce sequence dimension into time_embedding
+
+            # Concat the special text tokens
+            vae_seq = jnp.concatenate([image_special_token_embeds[:, 0:1, :], x_t_embeds, image_special_token_embeds[:, 1:2, :]], axis=1)
+
+            # Repeat 3 times along the batch dimension
+            vae_seq = jnp.concatenate([vae_seq, vae_seq, vae_seq], axis=0)
+
+            # Arrange the full sequence
+            full_seq = jnp.concatenate([pre_llm_image_latents, pre_llm_vit_tokens, text_embeds, vae_seq], axis=1)
+            assert full_seq.dtype == jnp.bfloat16 # just to make sure
+
+            # Run the mixture of transformers
+            hidden_states = train_state.apply_fn(
+                {"params": train_state.params},
+                x=full_seq,
+                token_types=all_token_types,
+                rope_pos_ids=all_rope_ids,
+                attn_bias=all_attn_biases,
+                name="mixture_of_transformers",
+            )
+
+            # Now we need to extract just the vae image tokens
+            vae_hidden_states = hidden_states[:, -num_vae_tokens:, :]
+            vae_hidden_states = vae_hidden_states[:, 1:-1, :]  # remove start and end special tokens
+
+            # Project with LLM2VAE
+            v_pred = train_state.apply_fn(
+                {"params": train_state.params},
+                tokens=vae_hidden_states,
+                grid_hw=(image_shape[0] // 16, image_shape[1] // 16),
+                name="llm2vae",
+            )
+            v_pred = v_pred.astype(jnp.float32) # convert to float32 which next few steps require
+            v_pred, cfg_text_v_pred, cfg_image_v_pred = v_pred[0:1], v_pred[1:2], v_pred[2:3]
+
+            # Text CFG
+            v_cfg_text_applied = cfg_text_v_pred + 4.0 * (v_pred - cfg_text_v_pred)
+            # we do the so called "text_channel" norm from the PyTorch codebase
+            norm_v_pred = jnp.linalg.norm(v_pred, axis=-1, keepdims=True)
+            norm_v_cfg_text_applied = jnp.linalg.norm(v_cfg_text_applied, axis=-1, keepdims=True)
+            scale = jnp.clip(norm_v_pred / (norm_v_cfg_text_applied + 1e-8), min=0.0, max=1.0)
+            v_cfg_text_applied = v_cfg_text_applied * scale
+
+            # Image CFG
+            v = cfg_image_v_pred + 2.0 * (v_cfg_text_applied - cfg_image_v_pred)
+            # no normalization for image CFG
+
+            # Unpatchify
+            v = ungroup_2x2(v)
+
+            # Euler integration
+            dt = jnp.take(dts, dts_idx)
+            x_t = x_t - v * dt
+
+            return {"x_t": x_t, "denoising_t": denoising_t - dt, "dts_idx": dts_idx + 1}, None
+
+        # We will call this function 49 times
+        scan_result = jax.lax.scan(step_fn_cfg, {"x_t": x, "denoising_t": jnp.ones((1,), dtype=jnp.float32), "dts_idx": jnp.array([0], dtype=jnp.int32)}, xs=None, length=49)
+        x = scan_result[0]["x_t"]
+
+        return x
+
+
+    gen_vae_latents = generate_image(train_state, text_ids, image, image_latents, image_shape, token_types, cfg_text_token_types, cfg_image_token_types, rope_ids, cfg_text_rope_ids, cfg_image_rope_ids, key)
+    return gen_vae_latents # already in float32
+
+###############################################################
+######################## Text -> Image ########################
+###############################################################
+# #prompt = "A female cosplayer portraying an ethereal fairy or elf, wearing a flowing dress made of delicate fabrics in soft, mystical colors like emerald green and silver. She has pointed ears, a gentle, enchanting expression, and her outfit is adorned with sparkling jewels and intricate patterns. The background is a magical forest with glowing plants, mystical creatures, and a serene atmosphere."
+# prompt = "A lantern glowing with green light, photorealistic"
+# gen_img_latent = text2image(prompt, (1024, 1024))
+
+# gen_img = ae_decode(ae_variables, gen_img_latent)
+# gen_img = np.array(gen_img)[0]
+# gen_img = np.clip((gen_img + 1) * 127.5, 0, 255).astype(np.uint8)
+# gen_img = Image.fromarray(gen_img)
+
+# gen_img.save("samples/a_green_lantern.png")
+
+###############################################################
+######################## Image Editing ########################
+###############################################################
+source_image = Image.open("samples/woman.jpg")
+prompt = "She boards a modern subway, quietly reading a folded newspaper, wearing the same clothes."
+gen_img_latent = image_editing(prompt, source_image)
 
 gen_img = ae_decode(ae_variables, gen_img_latent)
 gen_img = np.array(gen_img)[0]
 gen_img = np.clip((gen_img + 1) * 127.5, 0, 255).astype(np.uint8)
 gen_img = Image.fromarray(gen_img)
 
-gen_img.save("samples/banana_billboard.png")
+gen_img.save("samples/woman_in_subway.png")
