@@ -97,22 +97,13 @@ class GQA(nn.Module):
         self.v_txt = nn.Dense(512,        use_bias=True,  name="txt/v_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
         self.o_txt = nn.Dense(self.hidden, use_bias=False, name="txt/o_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
 
-        # gen (VAE) expert
-        self.q_gen = nn.Dense(self.hidden, use_bias=True,  name="gen/q_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
-        self.k_gen = nn.Dense(512,        use_bias=True,  name="gen/k_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
-        self.v_gen = nn.Dense(512,        use_bias=True,  name="gen/v_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
-        self.o_gen = nn.Dense(self.hidden, use_bias=False, name="gen/o_proj", dtype=self.param_dtype, param_dtype=self.param_dtype)
-
         # QK norm parameters
         self.q_norm_txt = RMSNorm(name="txt/q_norm")
         self.k_norm_txt = RMSNorm(name="txt/k_norm")
-        self.q_norm_gen = RMSNorm(name="gen/q_norm")
-        self.k_norm_gen = RMSNorm(name="gen/k_norm")
 
     def __call__(self,
                  x: jnp.ndarray,              # (B,L,3584)
                  *,
-                 token_types: jnp.ndarray,    # (B,L) 0=pad, 1=text/img, 2=vae
                  rope_pos_ids: jnp.ndarray,   # (B,L) int32
                  attn_bias: jnp.ndarray,      # (B,1,L,L)  large-neg where masked
                  cos: jnp.ndarray,
@@ -127,16 +118,8 @@ class GQA(nn.Module):
         d_q  = self.hidden // H            # 128 == rope_dim
         d_kv = 512 // H_kv                 # 128 == rope_dim
 
-        mask_gen = (token_types == 2)      # (B,L) bool
-
-        # ----------- projections (compute both, then select) --------------
-        q_txt, k_txt, v_txt = self.q_txt(x), self.k_txt(x), self.v_txt(x)
-        q_gen, k_gen, v_gen = self.q_gen(x), self.k_gen(x), self.v_gen(x)
-
-        sel   = mask_gen[..., None]        # broadcast dim
-        q = jnp.where(sel, q_gen, q_txt)
-        k = jnp.where(sel, k_gen, k_txt)
-        v = jnp.where(sel, v_gen, v_txt)
+        # ----------- projections --------------
+        q, k, v = self.q_txt(x), self.k_txt(x), self.v_txt(x)
 
         # reshape to heads first
         def split_heads(t, n_head, d_head):
@@ -146,20 +129,9 @@ class GQA(nn.Module):
         k = split_heads(k, H_kv, d_kv)
         v = split_heads(v, H_kv, d_kv)
 
-        # -------------- QK Norm ----------------------
-        sel_h = mask_gen[:, :, None, None]                 # (B, L, 1, 1)
-
-        q = jnp.where(
-            sel_h,                         
-            self.q_norm_gen(q),
-            self.q_norm_txt(q),
-        )
-
-        k = jnp.where(
-            sel_h,
-            self.k_norm_gen(k),
-            self.k_norm_txt(k),
-        )
+        # -------------- QK Norm -------------------
+        q = self.q_norm_txt(q)
+        k = self.k_norm_txt(k)
         
         # ----------- RoPE --------------
         q = apply_rope(q, rope_pos_ids, cos, sin)
@@ -179,14 +151,14 @@ class GQA(nn.Module):
             force_fp32_for_softmax=True,
         )
 
-        # ---------- merge heads & expert-specific out-proj -----------------
+        # ---------- merge heads & out-proj -----------------
         out = out.reshape(B, L, self.hidden)   # (B,L,3584)
 
-        # out might be in float32, but the projections below will convert to bf16 since we specified dtype=bfloat16 in their definitions
+        # out might be in float32, but the projection below will convert to bf16 since we specified dtype=bfloat16 in its definition
 
-        out_txt = self.o_txt(out)
-        out_gen = self.o_gen(out)
-        return jnp.where(sel, out_gen, out_txt)                   # (B,L,3584)
+        out = self.o_txt(out) # (B,L,3584)
+
+        return out                   
 
 
 class MoTBlock(nn.Module):
@@ -195,19 +167,15 @@ class MoTBlock(nn.Module):
     def setup(self):
         # RMSNorm banks
         self.in_rms_txt  = RMSNorm(name="txt/input_rms")
-        self.in_rms_gen  = RMSNorm(name="gen/input_rms")
         self.post_rms_txt = RMSNorm(name="txt/post_attn_rms")
-        self.post_rms_gen = RMSNorm(name="gen/post_attn_rms")
 
         # Attention & MLP
         self.attn = GQA(name="attn")
         self.mlp_txt = SwiGLU(expert="txt", name="txt/mlp")
-        self.mlp_gen = SwiGLU(expert="gen", name="gen/mlp")
 
     def __call__(self,
                  x: jnp.ndarray,
                  *,
-                 token_types: jnp.ndarray,
                  rope_pos_ids: jnp.ndarray,
                  attn_bias: jnp.ndarray,
                  cos: jnp.ndarray,
@@ -217,25 +185,22 @@ class MoTBlock(nn.Module):
         x = x.astype(jnp.bfloat16)
         attn_bias = attn_bias.astype(jnp.bfloat16)
 
-        mask_gen = (token_types == 2)[..., None]          # (B,L,1)
-
-        # expert-specific input RMS
-        h = jnp.where(mask_gen, self.in_rms_gen(x), self.in_rms_txt(x))
+        # RMS
+        h = self.in_rms_txt(x)
 
         # shared attention
         h = self.attn(h,
-                      token_types=token_types,
                       rope_pos_ids=rope_pos_ids,
                       attn_bias=attn_bias,
                       cos=cos, sin=sin,
                       )
         x = x + h
 
-        # expert-specific post-RMS
-        h = jnp.where(mask_gen, self.post_rms_gen(x), self.post_rms_txt(x))
+        # post-RMS
+        h = self.post_rms_txt(x)
 
         # expert-specific MLP
-        h = jnp.where(mask_gen, self.mlp_gen(h), self.mlp_txt(h))
+        h = self.mlp_txt(h)
 
         return x + h
 
@@ -248,11 +213,9 @@ class MixtureOfTransformers(nn.Module):
     def setup(self):
         self.blocks = [MoTBlock(name=f"layer_{i}") for i in range(self.depth)]
         self.out_rms_txt = RMSNorm(name="txt/final_rms")
-        self.out_rms_gen = RMSNorm(name="gen/final_rms")
 
     def __call__(self,
                  x: jnp.ndarray,                  # (B,L,3584)
-                 token_types: jnp.ndarray,         # (B,L) 0=pad, 1=text/img, 2=vae
                  rope_pos_ids: jnp.ndarray,
                  attn_bias: jnp.ndarray,
                 ):     
@@ -268,12 +231,11 @@ class MixtureOfTransformers(nn.Module):
         # ---- transformer stack ------------------------------------------
         for blk in self.blocks:
             x = blk(x,
-                    token_types=token_types,
                     rope_pos_ids=rope_pos_ids,
                     attn_bias=attn_bias,
                     cos=cos, sin=sin)
 
-        # ---- final norm per expert --------------------------------------
-        mask_gen = (token_types == 2)[..., None]
-        x = jnp.where(mask_gen, self.out_rms_gen(x), self.out_rms_txt(x))
+        # ---- final norm --------------------------------------
+        x = self.out_rms_txt(x)
+        
         return x
