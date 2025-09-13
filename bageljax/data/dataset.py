@@ -85,8 +85,8 @@ def binarize_gripper_action(x):
     # Reverse the result to match the original order
     result = tf.reverse(x_zeroed, axis=[0])
 
-    # Set all nonzero values to 1
-    result = tf.where(result > 0, 1.0, 0.0)
+    # Set all nonzero values to 1, and zero values to -1
+    result = tf.where(result > 0, 1.0, -1.0)
 
     return result
 
@@ -181,12 +181,12 @@ class Dataset:
         dataset = dataset.map(self._decode_example, num_parallel_calls=self.num_parallel_calls)
 
         # yields trajectories
-        #dataset = dataset.filter(self._filter_by_len)
+        dataset = dataset.filter(self._filter_by_len)
         
-        # # yields trajectories
-        #dataset = dataset.map(
-        #    self._process_actions, num_parallel_calls=self.num_parallel_calls
-        #)
+        # yields trajectories
+        dataset = dataset.map(
+           self._process_actions_and_proprio, num_parallel_calls=self.num_parallel_calls
+        )
 
         # yields trajectories
         #dataset = dataset.map(self._chunk, num_parallel_calls=self.num_parallel_calls)
@@ -327,26 +327,26 @@ class Dataset:
         # Return a boolean indicating whether to keep this example
         return traj_len >= 20
 
-    def _process_actions(self, traj):
-        # normalize actions and proprio
-        if self.action_proprio_metadata is not None:
-            if self.normalization_type == "normal":
-                # normalize to mean 0, std 1
-                action_mean, action_std = self.action_proprio_metadata["action_mean"], self.action_proprio_metadata["action_std"]
-                proprio_mean, proprio_std = self.action_proprio_metadata["proprio_mean"], self.action_proprio_metadata["proprio_std"]
-                traj["actions"] = tf.concat([(
-                    traj["actions"][:, :7] - action_mean
-                    ) / action_std, traj["actions"][:, 7:]], axis=1)
-                traj["observations"]["proprio"] = tf.concat([(
-                    traj["observations"]["proprio"][:, :7] - proprio_mean
-                    ) / proprio_std, traj["observations"]["proprio"][:, 7:]], axis=1)
-            else:
-                raise ValueError
-            
-        # binarize gripper component of actions
-        gripper_actions = traj["actions"][:, -1]
-        binarized_gripper_actions = binarize_gripper_action(gripper_actions)
-        traj["actions"] = tf.concat([traj["actions"][:, :-1], binarized_gripper_actions[..., tf.newaxis]], axis=1)
+    def _process_actions_and_proprio(self, traj):
+        # Binarize gripper actions
+        gripper_binarized = binarize_gripper_action(traj["observation/robot_state/gripper_position"])
+
+        # Concat gripper with movement
+        movement_and_gripper = tf.concat([traj["observation/robot_state/joint_positions"], gripper_binarized[:, tf.newaxis]], axis=1)
+
+        # Normalize
+        assert self.action_proprio_metadata is not None and self.normalization_type == "normal"
+        mean, std = tf.squeeze(self.action_proprio_metadata["mean"]), tf.squeeze(self.action_proprio_metadata["std"])
+        mean, std = mean[tf.newaxis, :], std[tf.newaxis, :] # add back in trajectory dimension to ensure broadcasting works correctly
+        movement_and_gripper = (movement_and_gripper - mean) / (std + 1e-6) # matches normalization in action tokenizer implementation
+        
+        # Insert into dict
+        traj["proprio"] = movement_and_gripper
+        # We will construct actions later from proprio
+
+        # Delete old keys
+        del traj["observation/robot_state/gripper_position"]
+        del traj["observation/robot_state/joint_positions"]
 
         return traj
 
@@ -399,6 +399,8 @@ class Dataset:
         traj["observations"]["wrist"] = tf.cast(tf.image.resize(traj["observations"]["wrist"], (384, 384), method="bicubic"), tf.uint8)
 
         return traj
+
+    ######################### Iterator ############################
 
     def iterator(self):
         return self.tf_dataset.prefetch(tf.data.AUTOTUNE).as_numpy_iterator()
