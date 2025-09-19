@@ -7,7 +7,8 @@ data_paths = [["/home/pranav/bageljax/tfrecords/success-00007.tfrecord"]]
 dataset = Dataset(
     data_paths,
     0,
-    batch_size=1,
+    action_proprio_metadata={"mean": np.zeros((8,), dtype=np.float32), "std": np.ones((8,), dtype=np.float32)},
+    batch_size=2,
     train=False,
 )
 
@@ -20,3 +21,4 @@ for key in batch.keys():
         print(key, batch[key].shape, batch[key].dtype)
     else:
         print(key, batch[key][0].decode("utf-8"))
+        print(key, batch[key][1].decode("utf-8"))

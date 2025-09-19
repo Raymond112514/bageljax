@@ -189,21 +189,23 @@ class Dataset:
         )
 
         # yields trajectories
-        #dataset = dataset.map(self._chunk, num_parallel_calls=self.num_parallel_calls)
-
-        # # yields trajectories
-        #dataset = dataset.map(self._remove_unwanted_keys, num_parallel_calls=self.num_parallel_calls)
+        dataset = dataset.map(self._chunk, num_parallel_calls=self.num_parallel_calls)
 
         # unbatch to yield individual transitions
         dataset = dataset.unbatch()
 
         # yields individual transitions
-        #dataset = dataset.map(
-        #    self._process_images, num_parallel_calls=self.num_parallel_calls
-        #)
+        dataset = dataset.map(
+           self._select_language_instr, num_parallel_calls=self.num_parallel_calls
+        )
 
         # yields individual transitions
-        #dataset = dataset.filter(self._lang_filter_fn)
+        dataset = dataset.filter(self._lang_filter_fn)
+
+        # yields individual transitions
+        dataset = dataset.map(
+           self._stack_and_reshape_images, num_parallel_calls=self.num_parallel_calls
+        )
 
         # To ensure determinism if we're in validation mode
         opts = tf.data.Options()
@@ -351,54 +353,65 @@ class Dataset:
         return traj
 
     def _chunk(self, traj):
-        traj_len = tf.shape(traj["actions"])[0]
-        actions_remaining = traj_len - tf.range(traj_len)
+        traj_len = tf.shape(traj["proprio"])[0]
+        proprio_padded = tf.concat([traj["proprio"], tf.tile(traj["proprio"][-1:, :], (self.chunk_size, 1))], axis=0)
         
-        def collect_and_pad_sequences(idx_length):
-            idx, length = idx_length[0], idx_length[1]
-            sequence = tf.gather(traj["actions"], tf.range(idx, idx+length))
-            
-            # Pad with self.chunk_size additional zeros
-            zero_movement_actions = tf.zeros((self.chunk_size, 7), dtype=tf.float32)
-            zero_movement_actions = (zero_movement_actions - self.action_proprio_metadata["action_mean"]) / self.action_proprio_metadata["action_std"]
-            zero_actions = tf.concat([zero_movement_actions, tf.tile(sequence[-1:, -1:], (self.chunk_size, 1))], axis=1)
-            sequence = tf.concat([sequence, zero_actions], axis=0)
-
-            # Select the first self.chunk_size actions
-            sequence = sequence[:self.chunk_size]
-
+        def collect_sequences(idx):
+            sequence = tf.gather(proprio_padded, tf.range(idx+1, idx+1+self.chunk_size))
             return sequence
         
-        indices_and_lengths = tf.stack([tf.range(traj_len), actions_remaining], axis=1)
-
-        action_sequences = tf.map_fn(
-            collect_and_pad_sequences, 
-            indices_and_lengths, 
+        action_chunks = tf.map_fn(
+            collect_sequences, 
+            tf.range(traj_len), 
             dtype=tf.float32,
             parallel_iterations=self.num_parallel_calls  # Adjust this based on your hardware capabilities
         )
 
-        traj["action_sequences"] = action_sequences
+        traj["action_chunks"] = action_chunks
 
         return traj
 
     ######################### Example level transforms ############################
 
-    def _lang_filter_fn(self, batch_elem):
-        keep = batch_elem["language"] != b""
+    def _select_language_instr(self, transition):
+        random_number = tf.random.uniform((1,), maxval=3, dtype=tf.int32)[0]
+        language_1 = transition["language_instruction1"]
+        language_2 = transition["language_instruction2"]
+        language_3 = transition["language_instruction3"]
+        
+        language = language_1
+        language = tf.where(random_number == 1, language_2, language)
+        language = tf.where(random_number == 2, language_3, language)
+
+        transition["language_instruction"] = language
+        del transition["language_instruction1"]
+        del transition["language_instruction2"]
+        del transition["language_instruction3"]
+
+        return transition
+
+    def _lang_filter_fn(self, transition):
+        keep = transition["language_instruction"] != b""
         return keep
     
-    def _process_images(self, traj):
-        # Resize images to (384, 384) and scale to [-1, 1]
-        traj["observations"]["shoulder_1"] = tf.ensure_shape(traj["observations"]["shoulder_1"], [None, 180, 320, 3])
-        traj["observations"]["shoulder_2"] = tf.ensure_shape(traj["observations"]["shoulder_2"], [None, 180, 320, 3])
-        traj["observations"]["wrist"] = tf.ensure_shape(traj["observations"]["wrist"], [None, 180, 320, 3])
+    def _stack_and_reshape_images(self, transition):
+        random_number = tf.random.uniform((1,), maxval=2, dtype=tf.int32)[0]
+        shoulder = transition["shoulder_image_1"]
+        shoulder = tf.where(random_number == 1, transition["shoulder_image_2"], shoulder)
 
-        traj["observations"]["shoulder_1"] = tf.cast(tf.image.resize(traj["observations"]["shoulder_1"], (384, 384), method="bicubic"), tf.uint8)
-        traj["observations"]["shoulder_2"] = tf.cast(tf.image.resize(traj["observations"]["shoulder_2"], (384, 384), method="bicubic"), tf.uint8)
-        traj["observations"]["wrist"] = tf.cast(tf.image.resize(traj["observations"]["wrist"], (384, 384), method="bicubic"), tf.uint8)
+        wrist = transition["wrist_image"]
 
-        return traj
+        shoulder_and_wrist = tf.concat([shoulder, wrist], axis=0)
+        shoulder_and_wrist = tf.ensure_shape(shoulder_and_wrist, [576, 512, 3])
+
+        shoulder_and_wrist = tf.cast(tf.round(tf.image.resize(shoulder_and_wrist, (672, 560), method="bicubic")), tf.uint8)
+        
+        transition["image"] = shoulder_and_wrist
+        del transition["shoulder_image_1"]
+        del transition["shoulder_image_2"]
+        del transition["wrist_image"]
+
+        return transition
 
     ######################### Iterator ############################
 
