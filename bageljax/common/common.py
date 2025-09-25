@@ -157,7 +157,7 @@ class TrainState(struct.PyTreeNode):
         )
 
     def apply_loss_fns(
-        self, loss_fns: Any, has_aux: bool = False, return_grad_norm: bool = False,
+        self, loss_fns: Any, has_aux: bool = False,
     ) -> Union["TrainState", Tuple["TrainState", Any]]:
         """
         Convenience method to compute gradients based on `self.params` and apply
@@ -199,16 +199,15 @@ class TrainState(struct.PyTreeNode):
         if has_aux:
             grads = jax.tree_util.tree_map(lambda _, x: self.cast_to_dtype(x[0], dtype=jnp.float32), loss_fns, grads_and_aux)            
             aux = jax.tree_util.tree_map(lambda _, x: x[1], loss_fns, grads_and_aux)
-            if return_grad_norm:
-                grad_norm = optax.global_norm(grads)
-                return self.apply_gradients(grads=grads), aux, grad_norm
+            grad_norm = optax.global_norm(grads)
+            aux["grad_norm"] = grad_norm
             return self.apply_gradients(grads=grads), aux
         else:
             return self.apply_gradients(grads=self.cast_to_dtype(grads_and_aux, dtype=jnp.float32))
 
     @classmethod
     def create(
-        cls, *, apply_fn, params, txs, target_params=None, rng=jax.random.PRNGKey(0)
+        cls, *, apply_fn, params, txs, target_params=None, rng=jax.random.PRNGKey(0), force_f32=False
     ):
         """
         Initializes a new train state.
@@ -221,7 +220,8 @@ class TrainState(struct.PyTreeNode):
             rng: The rng key used to initialize the rng chain for `apply_loss_fns`.
         """
         # Params should already be in bfloat16, but just make sure. target_params will likely be in bf16, need to cast
-        params = cls.cast_to_dtype(params, dtype=jnp.bfloat16)
+        dtype_to_cast_to = jnp.bfloat16 if not force_f32 else jnp.float32
+        params = cls.cast_to_dtype(params, dtype=dtype_to_cast_to)
         if target_params is not None:
             target_params = cls.cast_to_dtype(target_params, dtype=jnp.float32)
         return cls(

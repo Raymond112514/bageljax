@@ -132,7 +132,7 @@ class ViTConnector(nn.Module):
                                 nn.initializers.normal(0.02, dtype=self.param_dtype),
                                 (self.max_grid ** 2, self.out_dim))
         idx = jnp.arange(hp)[:, None] * self.max_grid + jnp.arange(wp)[None, :]
-        return h + jnp.take(pos_xmodal, idx.reshape(-1), axis=0)
+        return h + jax.lax.stop_gradient(jnp.take(pos_xmodal, idx.reshape(-1), axis=0)) # these embeddings were never learnt, but rather initialized via 2D sin/cos
 
 class VisionEncoder(nn.Module):
     """NHWC pixels  → patch tokens in LLM space (3584-d)."""

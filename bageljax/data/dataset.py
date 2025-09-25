@@ -191,6 +191,9 @@ class Dataset:
         # yields trajectories
         dataset = dataset.map(self._chunk, num_parallel_calls=self.num_parallel_calls)
 
+        # yields trajectories
+        dataset = dataset.map(self._remove_gripper_from_proprio, num_parallel_calls=self.num_parallel_calls)
+
         # unbatch to yield individual transitions
         dataset = dataset.unbatch()
 
@@ -368,6 +371,11 @@ class Dataset:
         )
 
         traj["action_chunks"] = action_chunks
+
+        return traj
+
+    def _remove_gripper_from_proprio(self, traj):
+        traj["proprio"] = traj["proprio"][:, :-1]
 
         return traj
 
