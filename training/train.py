@@ -404,9 +404,62 @@ def main(_):
             full_seq_rope_ids = jnp.concatenate([proprio_image_and_text_rope_ids, action_rope_ids], axis=1)
 
             # Now prepare attention masks
-            # To maintain closeness with pretraining, image tokens will not see proprio, even though it comes before
-            # 
+            # To maintain closeness with pretraining, image and text tokens will not see proprio, even though it comes 
+            # before in the sequence. However action tokens will, starting from the bos token
+            L = full_seq.shape[1]
+            # Start with a causal mask
+            causal = jnp.tril(jnp.ones((L, L), dtype=bool))
+            # the first token (proprio) can see itself, but all other tokens, up to the set of action tokens, cannot
+            replacement_first_col = jnp.concatenate([jnp.ones((1,), dtype=bool), jnp.zeros((L-2-action_token_embeds.shape[1],), dtype=bool), jnp.ones((action_token_embeds.shape[1]+1,), dtype=bool)])
+            causal = jnp.concatenate([replacement_first_col[:, None], causal[:, 1:]], axis=1)
+            # Enable full self-attention for vit tokens
+            arr = jnp.concatenate([jnp.zeros((1,), dtype=bool), jnp.ones((pre_llm_vit_tokens.shape[1],), dtype=bool), jnp.zeros((L - pre_llm_vit_tokens.shape[1] - 1), dtype=bool)])
+            self_attention_mask = jnp.matmul(arr[:, None], arr[None, :])
+            block_causal = causal | self_attention_mask
+            # Now tile to include pad dimension
+            block_causal = jnp.tile(block_causal[None, ...], (full_seq.shape[0], 1, 1))
+            # padding sees nothing, and is seen by nothing
+            padding = jnp.concatenate([jnp.zeros((full_seq.shape[0], 1 + pre_llm_vit_tokens.shape[1]), dtype=bool), jnp.logical_not(batch["text_token_masks"]), jnp.zeros((full_seq.shape[0], action_token_embeds.shape[1]))], axis=1)
+            allowed_attention = jnp.where(padding[:, :, None] | padding[:, None, :], False, block_causal)
+            attn_bias = jnp.where(allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
+            attn_bias = attn_bias.astype(jnp.bfloat16) # mixed precision is annoying, lol
 
+            # Now feed through the LLM
+            post_llm_seq = train_state.apply_fn(
+                {"params": params},
+                x=full_seq,
+                rope_pos_ids=full_seq_rope_ids,
+                attn_bias=attn_bias,
+                name="mixture_of_transformers",
+            )
+
+            # Extract just the action tokens
+            post_llm_action_tokens = post_llm_seq[:, -batch["action_tokens"].shape[1]:]
+
+            # Feed into LLM head
+            action_prediction_logits = train_state.apply_fn(
+                {"params": params},
+                hidden_states=post_llm_action_tokens,
+                name="logits_head",
+            )
+            # this should have shape (B, num_action_tokens, vocab_dim)
+
+            # Construct cross-entropy targets
+            action_token_targets = batch["action_tokens"] # just this, no change needed
+
+            loss = optax.losses.softmax_cross_entropy_with_integer_labels(action_prediction_logits, action_token_targets)
+            loss = jnp.mean(loss)
+
+            # For logging, let's compute the per-token classification accuracy, and all-token accuracy
+            argmax_prediction_matches = jnp.argmax(action_prediction_logits, axis=-1) == action_token_targets
+            token_accuracy = jnp.mean(argmax_prediction_matches)
+            seq_accuracy = jnp.mean(jnp.prod(argmax_prediction_matches, axis=-1))
+
+            return loss, {
+                "loss": loss,
+                "token_accuracy": token_accuracy,
+                "seq_accuracy": seq_accuracy,
+            }
 
         # compute gradients and update params
         new_state, info = train_state.apply_loss_fns(
