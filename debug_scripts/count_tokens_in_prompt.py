@@ -12,3 +12,6 @@ print("text ids:", text_ids)
 # this means the bos and eos tokens have not been added (which is what we expect)
 
 print(len(text_ids))
+
+print("\nSpecial tokens:")
+print(new_token_ids)
