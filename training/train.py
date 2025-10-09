@@ -99,13 +99,7 @@ def main(_):
     )
     train_data_iter = train_data.iterator()
     example_batch = next(train_data_iter)
-
-    # Batches of data will emerge from the data loader in float32. This function maps the relevant keys to bfloat16
-    # This should be called before the batch is sharded
-    def batch_to_bfloat16(batch):
-        batch["proprio"] = jnp.array(batch["proprio"], dtype=jnp.bfloat16)
-        # action chunks should for now remain in float32, since the action tokenizer expects this dtype
-        return batch
+    print("Data loader initialized")
 
     # Create the language tokenizer
     tokenizer_load_path = FLAGS.config.tokenizer_load_path
@@ -127,8 +121,6 @@ def main(_):
         batch_masks = []
         batch_text_rope_ids = []
         for i in range(B):
-            tokenized_language = []
-            masks = []
             rope_ids = []
             prompt = "What actions should the robot take to complete the following language instruction:\n\n"
             prompt += batch["language_instruction"][i].decode("utf-8").strip()
@@ -148,7 +140,7 @@ def main(_):
             num_pad_tokens = MAX_PROMPT_LENGTH - non_pad_tokens_in_prompt
             prompt_text_ids = [PAD_TOKEN_ID] * num_pad_tokens + prompt_text_ids
             prompt_text_ids = jnp.array(prompt_text_ids, dtype=jnp.int32)
-            masks = jnp.concatenate([jnp.zeros((num_pad_tokens,), dtype=bool), jnp.ones((non_pad_tokens_in_prompt,), dtype=bool)])
+            masks = jnp.concatenate([jnp.zeros((num_pad_tokens,), dtype=bool), jnp.ones((non_pad_tokens_in_prompt,), dtype=bool)]) # false means padding, true means valid text token
             text_rope_ids = jnp.concatenate([
                 jnp.zeros((num_pad_tokens,), dtype=jnp.int32), # the rope IDs for pad tokens doesn't matter
                 jnp.arange(non_pad_tokens_in_prompt, dtype=jnp.int32) + 2, # start from 2, since the image and proprio come before
@@ -173,6 +165,7 @@ def main(_):
     rng = jax.random.PRNGKey(FLAGS.config.seed)
 
     # Create the FSQ encoder
+    print("Initializing FSQ action tokenizer...")
     action_tokenizer = ActionTokenizer()
     
     def action_tokenizer_init_fn(rng):
@@ -234,12 +227,15 @@ def main(_):
         assert action_tokens.dtype == jnp.int32
 
         # Add in the vocabulary offset
-        action_tokens = action_tokens + FLAGS.config.policy_kwargs["action_tokens_offset"]
+        action_tokens = action_tokens + FLAGS.config.dataset_kwargs["action_tokens_offset"]
 
         del batch["action_chunks"]
         batch["action_tokens"] = action_tokens
 
         return batch
+
+    # Initialize the main model
+    print("Initializing BagelVLA model...")
 
     networks = {
         "token_embedder": TokenEmbedder(),
@@ -311,18 +307,25 @@ def main(_):
     train_state = jax.jit(init_fn, out_shardings=train_state_sharding)(key)
 
     # Load from pre-trained Bagel checkpoint
-    # Note the pre-trained checkpoint has only params, not target_params and optimizer states
-    loaded_params = checkpoints.restore_checkpoint(
-        FLAGS.config.resume_path,
-        target=train_state.params, # restore directly into param tree
+    # Checkpoint loading requires some extra logic here
+    print("Loading from pre-trained Bagel checkpoint...")
+    train_state = checkpoints.restore_checkpoint(
+        FLAGS.config.pretrained_bagel_path,
+        target=train_state,
     )
-    to = jax.tree_util.tree_map
-    params_bf16 = to(lambda x: x.astype(jnp.bfloat16), loaded_params)
-    target_f32  = to(lambda x: x.astype(jnp.float32),  loaded_params)
-    train_state = train_state.replace(
-        params=params_bf16,
-        target_params=target_f32,
-    )
+    # At this point, everything has been restored correctly, except for the train_state's target parameters
+    # This is a (kinda hacky) fix to properly re-initialize the target params
+    train_state = train_state.target_update(tau=1.0)
+    print("Loaded from pre-trained Bagel")
+
+    # Load from a previous checkpoint if necessary
+    if FLAGS.config.get("resume_path", None) is not None:
+        print("Loading from previous checkpoint...")
+        train_state = checkpoints.restore_checkpoint(
+            FLAGS.config.resume_path,
+            target=train_state,
+        )
+        print("Loaded from previous checkpoint")
 
     # Print total number of parameters of the model
     print("Total model parameters: ", sum([np.prod(v.shape) for v in jax.tree_util.tree_leaves(train_state.params)]))
@@ -369,6 +372,7 @@ def main(_):
                 token_ids=image_special_token_ids[None, :],
                 name="token_embedder",
             )
+            image_special_token_embeds = jnp.tile(image_special_token_embeds, (pre_llm_vit_tokens.shape[0], 1, 1))
 
             # concat the special image tokens
             pre_llm_vit_tokens = jnp.concatenate([image_special_token_embeds[:, 0:1], pre_llm_vit_tokens, image_special_token_embeds[:, 1:2]], axis=1)
@@ -416,7 +420,7 @@ def main(_):
             arr = jnp.concatenate([jnp.zeros((1,), dtype=bool), jnp.ones((pre_llm_vit_tokens.shape[1],), dtype=bool), jnp.zeros((L - pre_llm_vit_tokens.shape[1] - 1), dtype=bool)])
             self_attention_mask = jnp.matmul(arr[:, None], arr[None, :])
             block_causal = causal | self_attention_mask
-            # Now tile to include pad dimension
+            # Now tile to include batch dimension
             block_causal = jnp.tile(block_causal[None, ...], (full_seq.shape[0], 1, 1))
             # padding sees nothing, and is seen by nothing
             padding = jnp.concatenate([jnp.zeros((full_seq.shape[0], 1 + pre_llm_vit_tokens.shape[1]), dtype=bool), jnp.logical_not(batch["text_token_masks"]), jnp.zeros((full_seq.shape[0], action_token_embeds.shape[1]))], axis=1)
@@ -447,19 +451,27 @@ def main(_):
             # Construct cross-entropy targets
             action_token_targets = batch["action_tokens"] # just this, no change needed
 
+            # Critical: loss should be computed in float32
+            action_prediction_logits = jnp.astype(action_prediction_logits, dtype=jnp.float32)
+
             loss = optax.losses.softmax_cross_entropy_with_integer_labels(action_prediction_logits, action_token_targets)
             loss = jnp.mean(loss)
 
             # For logging, let's compute the per-token classification accuracy, and all-token accuracy
             argmax_prediction_matches = jnp.argmax(action_prediction_logits, axis=-1) == action_token_targets
             token_accuracy = jnp.mean(argmax_prediction_matches)
+            per_token_accuracies = jnp.mean(argmax_prediction_matches, axis=0)
             seq_accuracy = jnp.mean(jnp.prod(argmax_prediction_matches, axis=-1))
 
-            return loss, {
+            log_dict = {
                 "loss": loss,
                 "token_accuracy": token_accuracy,
                 "seq_accuracy": seq_accuracy,
             }
+            for token_num in range(per_token_accuracies.shape[0]):
+                log_dict[f"token{token_num}_acc"] = per_token_accuracies[token_num]
+
+            return loss, log_dict
 
         # compute gradients and update params
         new_state, info = train_state.apply_loss_fns(
@@ -483,7 +495,6 @@ def main(_):
 
             timer.tick("dataset")
             batch = next(train_data_iter)
-            batch = batch_to_bfloat16(batch)
             batch = tokenize_and_pad(batch)
             batch = shard_data(batch)
             batch = tokenize_action_chunks(batch)
@@ -493,9 +504,11 @@ def main(_):
             train_state, update_info = update(train_state, batch, config, lr_schedule)
             timer.tock("train")
 
+            timer.tock("total")
+
             step = i + 1
 
-            if step % FLAGS.config.save_interval == 0 or step == 1000:
+            if step % FLAGS.config.save_interval == 0 or step == 100:
                 on_host_train_state = gather_train_state(train_state)
                 if jax.process_index() == 0:
                     logging.info("Saving checkpoint...")
@@ -503,8 +516,6 @@ def main(_):
                         save_dir, on_host_train_state, step=step, keep=1e7,
                     )
                     logging.info("Saved checkpoint to %s", checkpoint_path)
-
-            timer.tock("total")
 
             if step % FLAGS.config.log_interval == 0:
                 if jax.process_index() == 0:
