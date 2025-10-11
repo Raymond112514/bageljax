@@ -1,3 +1,9 @@
+import os
+os.environ["FLAX_USE_ORBAX_CHECKPOINTING"] = "0"
+import flax
+flax.config.update("flax_use_orbax_checkpointing", False)
+from flax.training import checkpoints
+
 import tensorflow as tf
 from functools import partial
 import jax
@@ -5,20 +11,18 @@ import jax.numpy as jnp
 from jax.experimental import multihost_utils, mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jax.experimental.multihost_utils import process_allgather
-import flax
 import optax
 import numpy as np
 import tqdm
 import traceback
 import wandb
 from absl import app, flags, logging
-from flax.training import checkpoints
 from ml_collections import config_flags
-import os
 import random
 import copy
 import datetime
 from einops import rearrange
+from flax.training.train_state import TrainState as FlaxTrainState
 
 from bageljax.common.wandb import WandBLogger
 from bageljax.common.common import TrainState, ModuleDict, nonpytree_field
@@ -49,9 +53,6 @@ config_flags.DEFINE_config_file(
 )
 
 def main(_):
-    # Prevent flax.checkpoints from using Orbax backend
-    flax.config.update('flax_use_orbax_checkpointing', False)
-
     # set up wandb and logging
     wandb_config = WandBLogger.get_default_config()
     wandb_config.update(
@@ -193,21 +194,21 @@ def main(_):
     # Load action tokenizer from checkpoint
     # The action tokenizer checkpoint wasn't saved as a train state, but rather just the param pytree
     # This checkpoint loading process will also include checks to ensure that the params change (meaning the checkpoint is indeed loaded correctly)
-    loaded_params = checkpoints.restore_checkpoint(
-        FLAGS.config.action_tokenizer_resume_path,
-        target=action_tokenizer_train_state.params,
-    )
-    from flax.traverse_util import flatten_dict
-    def _flat(d): return {"/".join(k): v for k, v in flatten_dict(d, sep="/").items()}
-    f_tgt, f_ld = _flat(action_tokenizer_train_state.params), _flat(loaded_params)
-    missing = [k for k in f_tgt if k not in f_ld]
-    extra   = [k for k in f_ld if k not in f_tgt]
-    shape_mismatch = [(k, f_ld[k].shape, f_tgt[k].shape)
-                    for k in f_ld.keys() & f_tgt.keys()
-                    if f_ld[k].shape != f_tgt[k].shape]
-    if missing or extra or shape_mismatch:
-        raise ValueError(f"CKPT mismatch. missing={missing[:5]}, extra={extra[:5]}, shape_mismatch={shape_mismatch[:5]}")
-    action_tokenizer_train_state = action_tokenizer_train_state.replace(params=loaded_params)
+    #loaded_params = checkpoints.restore_checkpoint(
+    #    FLAGS.config.action_tokenizer_resume_path,
+    #    target=action_tokenizer_train_state.params,
+    #)
+    #from flax.traverse_util import flatten_dict
+    #def _flat(d): return {"/".join(k): v for k, v in flatten_dict(d, sep="/").items()}
+    #f_tgt, f_ld = _flat(action_tokenizer_train_state.params), _flat(loaded_params)
+    #missing = [k for k in f_tgt if k not in f_ld]
+    #extra   = [k for k in f_ld if k not in f_tgt]
+    #shape_mismatch = [(k, f_ld[k].shape, f_tgt[k].shape)
+    #                for k in f_ld.keys() & f_tgt.keys()
+    #                if f_ld[k].shape != f_tgt[k].shape]
+    #if missing or extra or shape_mismatch:
+    #    raise ValueError(f"CKPT mismatch. missing={missing[:5]}, extra={extra[:5]}, shape_mismatch={shape_mismatch[:5]}")
+    #action_tokenizer_train_state = action_tokenizer_train_state.replace(params=loaded_params)
 
     # Print number of params of action tokenizer
     print("Total action tokenizer parameters: ", sum([np.prod(v.shape) for v in jax.tree_util.tree_leaves(action_tokenizer_train_state.params)]))
@@ -308,15 +309,26 @@ def main(_):
 
     # Load from pre-trained Bagel checkpoint
     # Checkpoint loading requires some extra logic here
-    print("Loading from pre-trained Bagel checkpoint...")
-    train_state = checkpoints.restore_checkpoint(
-        FLAGS.config.pretrained_bagel_path,
-        target=train_state,
-    )
+    #print("Loading from pre-trained Bagel checkpoint...")
+    # First delete the proprio projector from the pytree (legacy flax checkpoints doesn't allow the target to have keys the checkpoint doesn't)
+    #proprio_projector_params = train_state.params["modules_proprio_projector"]
+    #del train_state.params["modules_proprio_projector"]
+    # Next construct a Flax TrainState
+    #flax_train_state = FlaxTrainState.create(
+    #    apply_fn=train_state.apply_fn,
+    #    params=train_state.params,
+    #    tx=optax.identity(),
+    #)
+    #flax_train_state = checkpoints.restore_checkpoint(
+    #    FLAGS.config.pretrained_bagel_path,
+    #    target=flax_train_state,
+    #)
+    #flax_train_state.params["modules_proprio_projector"] = proprio_projector_params
+    #train_state = train_state.replace(params=flax_train_state.params)
     # At this point, everything has been restored correctly, except for the train_state's target parameters
     # This is a (kinda hacky) fix to properly re-initialize the target params
-    train_state = train_state.target_update(tau=1.0)
-    print("Loaded from pre-trained Bagel")
+    #train_state = train_state.target_update(tau=1.0)
+    #print("Loaded from pre-trained Bagel")
 
     # Load from a previous checkpoint if necessary
     if FLAGS.config.get("resume_path", None) is not None:
@@ -423,7 +435,7 @@ def main(_):
             # Now tile to include batch dimension
             block_causal = jnp.tile(block_causal[None, ...], (full_seq.shape[0], 1, 1))
             # padding sees nothing, and is seen by nothing
-            padding = jnp.concatenate([jnp.zeros((full_seq.shape[0], 1 + pre_llm_vit_tokens.shape[1]), dtype=bool), jnp.logical_not(batch["text_token_masks"]), jnp.zeros((full_seq.shape[0], action_token_embeds.shape[1]))], axis=1)
+            padding = jnp.concatenate([jnp.zeros((full_seq.shape[0], 1 + pre_llm_vit_tokens.shape[1]), dtype=bool), jnp.logical_not(batch["text_token_masks"]), jnp.zeros((full_seq.shape[0], action_token_embeds.shape[1]), dtype=bool)], axis=1)
             allowed_attention = jnp.where(padding[:, :, None] | padding[:, None, :], False, block_causal)
             attn_bias = jnp.where(allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
             attn_bias = attn_bias.astype(jnp.bfloat16) # mixed precision is annoying, lol
@@ -452,7 +464,7 @@ def main(_):
             action_token_targets = batch["action_tokens"] # just this, no change needed
 
             # Critical: loss should be computed in float32
-            action_prediction_logits = jnp.astype(action_prediction_logits, dtype=jnp.float32)
+            action_prediction_logits = jnp.astype(action_prediction_logits, jnp.float32)
 
             loss = optax.losses.softmax_cross_entropy_with_integer_labels(action_prediction_logits, action_token_targets)
             loss = jnp.mean(loss)
@@ -497,7 +509,7 @@ def main(_):
             batch = next(train_data_iter)
             batch = tokenize_and_pad(batch)
             batch = shard_data(batch)
-            batch = tokenize_action_chunks(batch)
+            batch = tokenize_action_chunks(action_tokenizer_train_state, batch)
             timer.tock("dataset")
 
             timer.tick("train")

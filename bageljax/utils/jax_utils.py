@@ -88,7 +88,7 @@ def create_sharding(shard_type, train_state_shape=None):
                 x = np.split(x, len(mesh.local_devices), axis = 0) # per device data, but on host
                 x = jax.device_put(x, mesh.local_devices) # per device data, now on device
                 return jax.make_array_from_single_device_arrays(x_shape, data_sharding, x)
-        return jax.tree_map(_shard_data, batch)
+        return jax.tree_util.tree_map(_shard_data, batch)
         #return multihost_utils.host_local_array_to_global_array(
         #    batch, mesh, PartitionSpec("devices")
         #)
@@ -111,7 +111,7 @@ def gather_train_state(train_state):
         else:
             return param
     # Apply the all-gather function to all parameters in the train state
-    gathered_state = jax.tree_map(allgather_param, train_state)
+    gathered_state = jax.tree_util.tree_map(allgather_param, train_state)
     # Move the gathered parameters to host memory
     host_state = jax.device_get(gathered_state)
     return host_state

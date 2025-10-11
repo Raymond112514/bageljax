@@ -12,15 +12,15 @@ def get_config(config_string):
         resume_path=None,
         pretrained_bagel_path="gs://pranav-europe-west4/log/pretrained_bagel_checkpoint/pretrained_weights/bagel",
         action_tokenizer_resume_path="gs://pranav-europe-west4/log/fsq_eight_token_tokenizer/checkpoint_10",
-        tokenizer_load_path="/nfs/nfs3/users/pranav/bagel_tokenizer/tokenizer", # TODO: update with actual path
+        tokenizer_load_path="/nfs/nfs3/users/pranav/bagel_tokenizer",
         seed=137,
         #num_val_batches=16, # we'll train without a validation set
     )
 
     base_data_config = dict(
         dataset_path="gs://pranav-europe-west4/datasets/droid/success",
-        batch_size=16,
-        shuffle_buffer_size=50000,
+        batch_size=4,
+        shuffle_buffer_size=1000,
         chunk_size=16,
         num_parallel_calls=40,
         action_proprio_metadata=dict(

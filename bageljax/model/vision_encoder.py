@@ -1,4 +1,5 @@
 from typing import Tuple, Dict, Any, Optional
+import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from flax.linen import dot_product_attention
