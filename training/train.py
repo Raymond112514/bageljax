@@ -4,6 +4,19 @@ import flax
 flax.config.update("flax_use_orbax_checkpointing", False)
 from flax.training import checkpoints
 
+os.environ.setdefault("JAX_TRACEBACK_FILTERING", "off")  # show JAX internal frames
+os.environ.setdefault("JAX_LOG_COMPILES", "1")           # log every compile
+os.environ.setdefault("JAX_PLATFORMS", "tpu")            # safety: target TPU only
+# Dump HLO / MLIR for the crashing program (pick a writable path)
+os.environ.setdefault("XLA_FLAGS",
+    "--xla_dump_to=/tmp/xla_dumps "
+    "--xla_dump_hlo_as_text "
+    "--xla_dump_hlo_as_proto "
+    "--xla_dump_hlo_as_dot "
+    "--xla_dump_disable_metadata=false "
+    "--xla_dump_include_timestamp=true "
+)
+
 import tensorflow as tf
 from functools import partial
 import jax
@@ -30,7 +43,7 @@ from bageljax.common.optimizers import make_optimizer
 from bageljax.common.typing import Batch, PRNGKey
 from bageljax.data.dataset import glob_to_path_list, Dataset
 from bageljax.utils.timer_utils import Timer
-from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, gather_train_state
+from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, gather_train_state, add_batch_sharding_constraint, enforce_sharding_constraints
 from bageljax.model.vocabulary import TokenEmbedder, LogitsHead
 from bageljax.model.vision_encoder import VisionEncoder
 from bageljax.model.mixture_of_transformers import MixtureOfTransformers
@@ -140,20 +153,20 @@ def main(_):
             # Pad on the left
             num_pad_tokens = MAX_PROMPT_LENGTH - non_pad_tokens_in_prompt
             prompt_text_ids = [PAD_TOKEN_ID] * num_pad_tokens + prompt_text_ids
-            prompt_text_ids = jnp.array(prompt_text_ids, dtype=jnp.int32)
-            masks = jnp.concatenate([jnp.zeros((num_pad_tokens,), dtype=bool), jnp.ones((non_pad_tokens_in_prompt,), dtype=bool)]) # false means padding, true means valid text token
-            text_rope_ids = jnp.concatenate([
-                jnp.zeros((num_pad_tokens,), dtype=jnp.int32), # the rope IDs for pad tokens doesn't matter
-                jnp.arange(non_pad_tokens_in_prompt, dtype=jnp.int32) + 2, # start from 2, since the image and proprio come before
+            prompt_text_ids = np.array(prompt_text_ids, dtype=np.int32)
+            masks = np.concatenate([np.zeros((num_pad_tokens,), dtype=bool), np.ones((non_pad_tokens_in_prompt,), dtype=bool)]) # false means padding, true means valid text token
+            text_rope_ids = np.concatenate([
+                np.zeros((num_pad_tokens,), dtype=np.int32), # the rope IDs for pad tokens doesn't matter
+                np.arange(non_pad_tokens_in_prompt, dtype=np.int32) + 2, # start from 2, since the image and proprio come before
             ])
 
             batch_tokenized_language.append(prompt_text_ids)
             batch_masks.append(masks)
             batch_text_rope_ids.append(text_rope_ids)
 
-        batch_tokenized_language = jnp.stack(batch_tokenized_language)
-        batch_masks = jnp.stack(batch_masks)
-        batch_text_rope_ids = jnp.stack(batch_text_rope_ids)
+        batch_tokenized_language = np.stack(batch_tokenized_language)
+        batch_masks = np.stack(batch_masks)
+        batch_text_rope_ids = np.stack(batch_text_rope_ids)
 
         del batch["language_instruction"]
         batch["text_tokens"] = batch_tokenized_language
@@ -164,6 +177,9 @@ def main(_):
 
     # Initialize rng from config seed
     rng = jax.random.PRNGKey(FLAGS.config.seed)
+
+    # We're starting model creation; set enforce sharding constraints to false for this phase
+    enforce_sharding_constraints(False)
 
     # Create the FSQ encoder
     print("Initializing FSQ action tokenizer...")
@@ -229,6 +245,7 @@ def main(_):
 
         # Add in the vocabulary offset
         action_tokens = action_tokens + FLAGS.config.dataset_kwargs["action_tokens_offset"]
+        action_tokens = add_batch_sharding_constraint(action_tokens, where="action tokenizer output")
 
         del batch["action_chunks"]
         batch["action_tokens"] = action_tokens
@@ -267,7 +284,7 @@ def main(_):
         B = 1 # batch size
         H, W = 672, 672 # image height and width, 672 is divisible by 14 and 16 ---> no longer needs to be divisible by 16
         llm_hidden_dim = 3584 # LLM hidden dimension
-        L = 42*42 # sequence length, for llm2vae needs to be (H/16)*(W/16)
+        L = 256 # needs to be a multiple of 128 for flash attention
 
         params = model_def.init({'params': init_rng},
                                     token_embedder = [
@@ -365,10 +382,12 @@ def main(_):
                 name="proprio_projector",
             )
             pre_llm_proprio_token = pre_llm_proprio_token[:, None, :] # add a sequence dimension
+            pre_llm_proprio_token = add_batch_sharding_constraint(pre_llm_proprio_token, where="pre_llm_proprio_token")
 
             # Next the image
             image = jnp.astype(batch["image"], jnp.float32) / 127.5 - 1
             image = jnp.astype(image, jnp.bfloat16)
+            image = add_batch_sharding_constraint(image, where="image before vit")
             
             # Pass through ViT
             pre_llm_vit_tokens = train_state.apply_fn(
@@ -376,6 +395,7 @@ def main(_):
                 img=image,
                 name="vision_encoder",
             )
+            pre_llm_vit_tokens = add_batch_sharding_constraint(pre_llm_vit_tokens, where="image after vit")
 
             # Let's embed the start and end image tokens
             image_special_token_ids = jnp.array([new_token_ids['start_of_image'], new_token_ids['end_of_image']], dtype=jnp.int32)
@@ -385,9 +405,11 @@ def main(_):
                 name="token_embedder",
             )
             image_special_token_embeds = jnp.tile(image_special_token_embeds, (pre_llm_vit_tokens.shape[0], 1, 1))
+            image_special_token_embeds = add_batch_sharding_constraint(image_special_token_embeds, where="image_special_token_embeds")
 
             # concat the special image tokens
             pre_llm_vit_tokens = jnp.concatenate([image_special_token_embeds[:, 0:1], pre_llm_vit_tokens, image_special_token_embeds[:, 1:2]], axis=1)
+            pre_llm_vit_tokens = add_batch_sharding_constraint(pre_llm_vit_tokens, where="pre_llm_vit_tokens")
 
             # embed the text tokens
             text_embeds = train_state.apply_fn(
@@ -395,6 +417,7 @@ def main(_):
                 token_ids=batch["text_tokens"],
                 name="token_embedder",
             )
+            text_embeds = add_batch_sharding_constraint(text_embeds, where="text_embeds")
 
             # Embed the action tokens, dropping the last token (it will only be used as a target)
             action_tokens = batch["action_tokens"][:, :-1]
@@ -403,10 +426,12 @@ def main(_):
                 token_ids=action_tokens,
                 name="token_embedder",
             )
+            action_token_embeds = add_batch_sharding_constraint(action_token_embeds, where="action_token_embeds")
 
             # Concat everything along sequence dimension
             full_seq = jnp.concatenate([pre_llm_proprio_token, pre_llm_vit_tokens, text_embeds, action_token_embeds], axis=1)
-            
+            full_seq = add_batch_sharding_constraint(full_seq, where="full_seq")
+
             # Prepare full seq rope IDs
             proprio_and_image_rope_ids = jnp.concatenate([
                 jnp.zeros((1,), dtype=jnp.int32),
@@ -418,6 +443,7 @@ def main(_):
             action_rope_ids = jnp.tile((jnp.arange(action_tokens.shape[1], dtype=jnp.int32) + 1)[None, :], (full_seq.shape[0], 1))
             action_rope_ids = action_rope_ids + proprio_image_and_text_rope_ids[:, -1:]
             full_seq_rope_ids = jnp.concatenate([proprio_image_and_text_rope_ids, action_rope_ids], axis=1)
+            full_seq_rope_ids = add_batch_sharding_constraint(full_seq_rope_ids, where="full_seq_rope_ids")
 
             # Now prepare attention masks
             # To maintain closeness with pretraining, image and text tokens will not see proprio, even though it comes 
@@ -439,6 +465,7 @@ def main(_):
             allowed_attention = jnp.where(padding[:, :, None] | padding[:, None, :], False, block_causal)
             attn_bias = jnp.where(allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
             attn_bias = attn_bias.astype(jnp.bfloat16) # mixed precision is annoying, lol
+            attn_bias = add_batch_sharding_constraint(attn_bias, where="attn_bias")
 
             # Now feed through the LLM
             post_llm_seq = train_state.apply_fn(
@@ -448,6 +475,7 @@ def main(_):
                 attn_bias=attn_bias,
                 name="mixture_of_transformers",
             )
+            post_llm_seq = add_batch_sharding_constraint(post_llm_seq, where="post_llm_seq")
 
             # Extract just the action tokens
             post_llm_action_tokens = post_llm_seq[:, -batch["action_tokens"].shape[1]:]
@@ -459,6 +487,7 @@ def main(_):
                 name="logits_head",
             )
             # this should have shape (B, num_action_tokens, vocab_dim)
+            action_prediction_logits = add_batch_sharding_constraint(action_prediction_logits, where="action_prediction_logits")
 
             # Construct cross-entropy targets
             action_token_targets = batch["action_tokens"] # just this, no change needed
@@ -467,6 +496,7 @@ def main(_):
             action_prediction_logits = jnp.astype(action_prediction_logits, jnp.float32)
 
             loss = optax.losses.softmax_cross_entropy_with_integer_labels(action_prediction_logits, action_token_targets)
+            loss = add_batch_sharding_constraint(loss, where="loss before pmean")
             loss = jnp.mean(loss)
 
             # For logging, let's compute the per-token classification accuracy, and all-token accuracy
@@ -497,7 +527,10 @@ def main(_):
         new_state = new_state.target_update(1 - config["target_update_rate"])
 
         return new_state, info
-            
+           
+    # Starting train loop and thus compilation of the main graph; set enforce sharding constraints to true
+    enforce_sharding_constraints(True)
+
     # Train loop
     timer = Timer()
     starting_train_step = int(jax.device_get(train_state.step))
@@ -515,6 +548,13 @@ def main(_):
             timer.tick("train")
             train_state, update_info = update(train_state, batch, config, lr_schedule)
             timer.tock("train")
+
+            def _block(x):
+                if isinstance(x, jax.Array):
+                    x.block_until_ready()
+                return None
+
+            jax.tree_util.tree_map(_block, (train_state, update_info))
 
             timer.tock("total")
 

@@ -3,6 +3,7 @@ from typing import Optional
 import jax.numpy as jnp
 import flax.linen as nn
 
+from bageljax.utils.jax_utils import add_batch_sharding_constraint
 
 class TokenEmbedder(nn.Module):
     vocab_size: int = 152_064
@@ -18,6 +19,7 @@ class TokenEmbedder(nn.Module):
         )
 
     def __call__(self, token_ids: jnp.ndarray) -> jnp.ndarray:
+        token_ids = add_batch_sharding_constraint(token_ids, where="input to token embedder")
         return jnp.take(self.weight, token_ids, axis=0)
 
 
@@ -38,4 +40,5 @@ class LogitsHead(nn.Module):
         self,
         hidden_states: jnp.ndarray,
     ) -> jnp.ndarray:
+        hidden_states = add_batch_sharding_constraint(hidden_states, where="input to logits head")
         return jnp.einsum("...d,vd->...v", hidden_states, self.weight)

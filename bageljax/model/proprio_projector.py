@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import flax.linen as nn
+from bageljax.utils.jax_utils import add_batch_sharding_constraint
 
 class ProprioProjector(nn.Module):
     hidden_dim: int = 3584
@@ -8,6 +9,7 @@ class ProprioProjector(nn.Module):
 
     @nn.compact
     def __call__(self, proprio: jnp.ndarray) -> jnp.ndarray:
+        proprio = add_batch_sharding_constraint(proprio, where="input to proprio projector")
         x = nn.Dense(
             self.hidden_dim,
             dtype=self.param_dtype,
