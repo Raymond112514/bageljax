@@ -8,21 +8,21 @@ def get_config(config_string):
         log_interval=100,
         save_interval=5000,
         #eval_interval=5000, # we'll train without a validation set
-        save_dir="gs://pranav-europe-west4/log",
+        save_dir="gs://rail-tpus-pranav/log",
         resume_path=None,
         pretrained_bagel_path="gs://pranav-europe-west4/log/pretrained_bagel_checkpoint/pretrained_weights/bagel",
         action_tokenizer_resume_path="gs://pranav-europe-west4/log/fsq_eight_token_tokenizer/checkpoint_10",
-        tokenizer_load_path="/nfs/nfs3/users/pranav/bagel_tokenizer",
+        tokenizer_load_path="/nfs/nfs2/users/pranav/bagel_tokenizer",
         seed=137,
         #num_val_batches=16, # we'll train without a validation set
     )
 
     base_data_config = dict(
-        dataset_path="gs://pranav-europe-west4/datasets/droid/success",
-        batch_size=4,
+        dataset_path="gs://rail-tpus-pranav/datasets/droid/success",
+        batch_size=8,
         shuffle_buffer_size=1000,
         chunk_size=16,
-        num_parallel_calls=40,
+        num_parallel_calls=10,
         action_proprio_metadata=dict(
             mean=np.array([0.011434038169682026, 0.2440052479505539, -0.013901660218834877, -2.0293116569519043, -0.03873773291707039, 2.3191726207733154, 0.0831032246351242, -0.09849374741315842,], dtype=np.float32),
             std=np.array([0.31484323740005493, 0.5151926875114441, 0.2791784405708313, 0.5057438611984253, 0.5162752270698547, 0.4621083438396454, 0.7458285093307495, 0.9951376914978027,], dtype=np.float32),

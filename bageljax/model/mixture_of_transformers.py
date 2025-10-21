@@ -9,11 +9,19 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 import flax.linen as nn
 from flax.linen import dot_product_attention
+from flax.core import broadcast
 
 from bageljax.model.streaming_attention import streaming_attention
 from bageljax.utils.jax_utils import add_batch_sharding_constraint
 from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 from bageljax.utils.jax_utils import get_current_mesh, is_sharding_active
+
+# Optional: choose a conservative remat policy to reduce compile-time HLO size.
+try:
+    from jax.experimental.checkpoint import checkpoint_name, policies
+    REMAT_POLICY = policies.save_anything_but_these(policies.dots_policy, policies.conv_policy)
+except Exception:
+    REMAT_POLICY = None
 
 class RMSNorm(nn.Module):
     eps: float = 1e-6
@@ -241,7 +249,8 @@ class MoTBlock(nn.Module):
 
         # Attention & MLP
         self.attn = GQA(name="attn")
-        self.mlp_txt = nn.remat(SwiGLU)(expert="txt", name="txt/mlp")
+        #self.mlp_txt = nn.remat(SwiGLU)(expert="txt", name="txt/mlp")
+        self.mlp_txt = SwiGLU(expert="txt", name="txt/mlp")
 
     def __call__(self,
                  x: jnp.ndarray,
@@ -281,6 +290,38 @@ class MoTBlock(nn.Module):
 
         return x + h
 
+class MoTStep(nn.Module):
+    hidden: int
+
+    @nn.compact
+    def __call__(self,
+                 carry: jnp.ndarray,          # carry = x
+                 rope_pos_ids: jnp.ndarray,
+                 attn_bias: jnp.ndarray,
+                 cos: jnp.ndarray,
+                 sin: jnp.ndarray):
+        x = MoTBlock(hidden=self.hidden)(
+            carry,
+            rope_pos_ids=rope_pos_ids,
+            attn_bias=attn_bias,
+            cos=cos, sin=sin
+        )
+        # force no per-step outputs
+        return x, None
+
+# Wrap the step in nn.scan so parameters are stacked along layer axis (axis 0).
+# - variable_axes={"params": 0} says: fold a new leading axis into params for depth
+# - split_rngs={"params": True} gives unique init keys per step.
+#ScannedMoT = nn.scan(
+#    # You can wrap the step in remat to shrink HLO if desired:
+#    #(nn.remat(MoTStep, policy=REMAT_POLICY) if REMAT_POLICY else MoTStep),
+#    MoTStep,
+#    variable_axes={"params": 0},
+#    split_rngs={"params": True},
+#    in_axes=((None, None, None, None),),   # all non-carry args are broadcast
+#    out_axes=None,                      # we don't collect per-layer outputs
+#    unroll=1,                          # keep HLO tiny during compile
+#)
 
 class MixtureOfTransformers(nn.Module):
     depth:      int = 28
@@ -288,36 +329,97 @@ class MixtureOfTransformers(nn.Module):
     rope_dim:   int = 128
 
     def setup(self):
-        self.blocks = [MoTBlock(name=f"layer_{i}") for i in range(self.depth)]
         self.out_rms_txt = RMSNorm(name="txt/final_rms")
 
-    def __call__(self,
-                 x: jnp.ndarray,                  # (B,L,3584)
-                 rope_pos_ids: jnp.ndarray,
-                 attn_bias: jnp.ndarray,
-                ):    
+    @nn.compact
+    def __call__(self, x, rope_pos_ids, attn_bias):
         x = add_batch_sharding_constraint(x, where="x, input to MoT")
         rope_pos_ids = add_batch_sharding_constraint(rope_pos_ids, where="rope_pos_ids, input to MoT")
         attn_bias = add_batch_sharding_constraint(attn_bias, where="attn_bias, input to MoT")
 
-        # ensure bf16 (redundant, but let's be sure)
-        x = x.astype(jnp.bfloat16) 
+        x = x.astype(jnp.bfloat16)
         attn_bias = attn_bias.astype(jnp.bfloat16)
 
         B, L, _ = x.shape
 
-        # ---- RoPE tables -------------------------------------------------
-        cos, sin = rotary_cache(L, self.rope_dim)  # these will be in float32
+        # RoPE tables (keep in f32; scan inputs are broadcast, so cheap)
+        cos, sin = rotary_cache(L, self.rope_dim)
 
-        # ---- transformer stack ------------------------------------------
-        for blk in self.blocks:
-            x = blk(x,
-                    rope_pos_ids=rope_pos_ids,
-                    attn_bias=attn_bias,
-                    cos=cos, sin=sin)
+        ScannedMoT = nn.scan(
+            # You can checkpoint to reduce compile-time RAM:
+            # nn.remat(MoTStep),
+            nn.remat(MoTStep),
+            variable_axes={"params": 0},
+            split_rngs={"params": True},
+            in_axes=(broadcast, broadcast, broadcast, broadcast),   # four separate broadcast xs
+            out_axes=None,                      # ys=None from the step
+            length=self.depth,                  # <-- set length here
+            unroll=1,
+        )
 
-        # ---- final norm --------------------------------------
+        layers = ScannedMoT(name="layers", hidden=self.hidden)
+
+        # Call with carry first, then the four xs (no length kwarg here)
+        x, _ = layers(x, rope_pos_ids, attn_bias, cos, sin)
+
+        # ----- final norm -----
         x = self.out_rms_txt(x)
         x = add_batch_sharding_constraint(x, where="output of MoT")
-        
         return x
+
+#class MixtureOfTransformers(nn.Module):
+#    depth:      int = 28
+#    hidden:     int = 3584
+#    rope_dim:   int = 128
+
+#    def setup(self):
+#        #self.blocks = [MoTBlock(name=f"layer_{i}") for i in range(self.depth)]
+#        self.out_rms_txt = RMSNorm(name="txt/final_rms")
+
+#    @nn.compact
+#    def __call__(self,
+#                 x: jnp.ndarray,                  # (B,L,3584)
+#                 rope_pos_ids: jnp.ndarray,
+#                 attn_bias: jnp.ndarray,
+#                ):    
+#        x = add_batch_sharding_constraint(x, where="x, input to MoT")
+#        rope_pos_ids = add_batch_sharding_constraint(rope_pos_ids, where="rope_pos_ids, input to MoT")
+#        attn_bias = add_batch_sharding_constraint(attn_bias, where="attn_bias, input to MoT")
+
+#        # ensure bf16 (redundant, but let's be sure)
+#        x = x.astype(jnp.bfloat16) 
+#        attn_bias = attn_bias.astype(jnp.bfloat16)
+
+#        B, L, _ = x.shape
+
+#        # ---- RoPE tables -------------------------------------------------
+#        cos, sin = rotary_cache(L, self.rope_dim)  # these will be in float32
+
+#        # ---- transformer stack ------------------------------------------
+#        #for blk in self.blocks:
+#        #    x = blk(x,
+#        #            rope_pos_ids=rope_pos_ids,
+#        #            attn_bias=attn_bias,
+#        #            cos=cos, sin=sin)
+
+#        ScannedBlock = nn.scan(
+#            MoTBlock,
+#            variable_axes={"params": 0},            # params stacked on layer axis
+#            split_rngs={"params": True},            # distinct init keys per layer
+#            length=self.depth,
+#            in_axes=(nn.carry,                      # x is the carry
+#                     nn.broadcast,                  # rope_pos_ids
+#                     nn.broadcast,                  # attn_bias
+#                     nn.broadcast,                  # cos
+#                     nn.broadcast),                 # sin
+#            out_axes=nn.carry,                      # return the carried x
+#        )
+
+#        layers = ScannedBlock(name="layers", hidden=self.hidden)
+#        x = layers(x, rope_pos_ids, attn_bias, cos, sin)
+    
+#        # ---- final norm --------------------------------------
+#        x = self.out_rms_txt(x)
+#        x = add_batch_sharding_constraint(x, where="output of MoT")
+        
+#        return x
