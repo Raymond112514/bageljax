@@ -19,8 +19,8 @@ def get_config(config_string):
 
     base_data_config = dict(
         dataset_path="gs://pranav-europe-west4/datasets/droid/success",    #"gs://rail-tpus-pranav/datasets/droid/success",
-        batch_size=8,
-        shuffle_buffer_size=3000,
+        batch_size=4,
+        shuffle_buffer_size=1000,
         chunk_size=16,
         num_parallel_calls=10,
         action_proprio_metadata=dict(

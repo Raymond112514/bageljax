@@ -32,7 +32,7 @@ from bageljax.common.optimizers import make_optimizer
 from bageljax.common.typing import Batch, PRNGKey
 from bageljax.data.dataset import glob_to_path_list, Dataset
 from bageljax.utils.timer_utils import Timer
-from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, gather_train_state, add_batch_sharding_constraint, enforce_sharding_constraints, unset_context_mesh, reset_context_mesh
+from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, add_batch_sharding_constraint, enforce_sharding_constraints, unset_context_mesh, reset_context_mesh
 from bageljax.model.vocabulary import TokenEmbedder, LogitsHead
 from bageljax.model.vision_encoder import VisionEncoder
 from bageljax.model.mixture_of_transformers import MixtureOfTransformers
@@ -520,32 +520,16 @@ def main(_):
     # Starting train loop and thus compilation of the main graph; set enforce sharding constraints to true
     enforce_sharding_constraints(True)
 
-    # Build one checkpointer per process (top-level, not per-step).
-    #_checkpointer = ocp.AsyncCheckpointer(ocp.StandardCheckpointHandler())
+    # Prepare for checkpointing the model
+    checkpointer = ocp.AsyncCheckpointer(ocp.StandardCheckpointHandler())
 
-    # Optional: a simple lock so you don’t overlap saves on one host.
-    #_ckpt_lock = threading.Lock()
-
-    def _barrier_mesh():
-        """Returns the (processes, local_devices) mesh that JAX multihost utils expect."""
-        devs = np.array(jax.devices()).reshape(jax.process_count(), jax.local_device_count())
-        return jax.sharding.Mesh(devs, ('processes', 'local_devices'))
-
-    def save_ckpt(save_dir: str, step: int, state):
-        """Call on ALL hosts. Orbax will write each host's shards into the same step dir."""
+    def save_ckpt(save_dir: str, step: int, train_state):
+        """Asynchronous, multihost-safe save. Call from ALL hosts, outside any mesh context."""
         step_dir = epath.Path(save_dir) / f"{int(step):08d}"
-        save_args = orbax_utils.save_args_from_target(state)  # build metadata once
-
-        def _worker():
-            # IMPORTANT: use the barrier mesh while calling .save() to avoid device-id mismatch.
-            with _barrier_mesh():
-                # AsyncCheckpointer.save returns immediately; Orbax writes in the background.
-                _checkpointer.save(step_dir, args=ocp.args.StandardSave(state, save_args=save_args))
-
-        # Launch on a clean thread to decouple from any training pjit contexts.
-        with _ckpt_lock:
-            t = threading.Thread(target=_worker, daemon=True)
-            t.start()
+        # Describe how to save each leaf (dtype/shape/metadata) without touching array data.
+        save_args = orbax_utils.save_args_from_target(train_state)
+        # Returns immediately; writes happen in the background.
+        checkpointer.save(step_dir, args=ocp.args.StandardSave(train_state, save_args=save_args))
 
     # Train loop
     timer = Timer()
@@ -576,7 +560,7 @@ def main(_):
 
             step = i + 1
 
-            if step % FLAGS.config.save_interval == 0 or step == 100:
+            if step % FLAGS.config.save_interval == 0 or step == 20:
                 save_ckpt(save_dir, step, train_state)
 
             if step % FLAGS.config.log_interval == 0:

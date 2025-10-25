@@ -16,7 +16,6 @@ import numpy as np
 import tqdm
 import traceback
 import wandb
-from flax.training import checkpoints
 import os
 import random
 import copy
@@ -46,22 +45,17 @@ def add_batch_sharding_constraint(x, *, axis_name='devices', where=''):
         return x
     if not isinstance(x, (jax.Array, jcore.Tracer)):
         return x
-
-    pspec = PartitionSpec(axis_name, *([None] * (x.ndim - 1)))
-
-    def _constrain(v):
-        return lax.with_sharding_constraint(v, pspec)
-
-    # Name this call so compilation errors include the `where` tag.
-    name = f"add_batch_sharding_constraint[{where}]" if where else "add_batch_sharding_constraint"
-    return jax.named_call(_constrain, name=name)(x)
-
-def unset_context_mesh():
-    jax.set_mesh(None)
-
-def reset_context_mesh():
+    
     global _CURRENT_MESH
-    jax.set_mesh(_CURRENT_MESH)
+    with _CURRENT_MESH:
+        pspec = PartitionSpec(axis_name, *([None] * (x.ndim - 1)))
+
+        def _constrain(v):
+            return lax.with_sharding_constraint(v, pspec)
+
+        # Name this call so compilation errors include the `where` tag.
+        name = f"add_batch_sharding_constraint[{where}]" if where else "add_batch_sharding_constraint"
+        return jax.named_call(_constrain, name=name)(x)
 
 def host_broadcast_str(x: str) -> str:
     """Broadcast_one_to_all, but with a string. Strings should all be the same length."""
@@ -87,7 +81,6 @@ def initialize_compilation_cache(
 def create_sharding(shard_type, train_state_shape=None):
     device_mesh = mesh_utils.create_device_mesh((jax.device_count(),))
     mesh = Mesh(devices=device_mesh, axis_names=('devices',))
-    jax.set_mesh(mesh) # a mesh in-context is needed for specifying sharding constraints later
     global _CURRENT_MESH
     _CURRENT_MESH = mesh
     data_sharding = NamedSharding(mesh, PartitionSpec('devices'))
@@ -114,7 +107,8 @@ def create_sharding(shard_type, train_state_shape=None):
                 if shape[i] % jax.device_count() == 0:
                     return all_nones[:i] + ('devices',) + all_nones[i+1:]
                     # return all_nones[:i] + ('shards',) + all_nones[i+1:]
-            raise ValueError(f"Could not shard parameter of shape {shape}")
+            return all_nones # this version will replicate if a param doesn't have a dimension that can be sharded
+            #raise ValueError(f"Could not shard parameter of shape {shape}")
         train_state_sharding = jax.tree_util.tree_map(
             lambda spec: NamedSharding(mesh, PartitionSpec(*shard_parameter(spec))), 
             flax.linen.unbox(train_state_shape))
@@ -172,14 +166,3 @@ def create_sharding(shard_type, train_state_shape=None):
     # The last two are helper functions for moving data between devices.
     return data_sharding, train_state_sharding, no_shard, shard_data, global_to_local
 
-def gather_train_state(train_state):
-    """All hosts call this; returns a host-NumPy pytree of global arrays."""
-    def _g(x):
-        if isinstance(x, jax.Array):
-            # Assemble the full global array on every host, independent of sharding.
-            gx = multihost_utils.process_allgather(x, tiled=True)
-            return np.asarray(gx)              # host NumPy (legacy checkpoints want this)
-        else:
-            # Non-jax.Array leaves (scalars, small arrays) -> bring to host if needed.
-            return jax.device_get(x)
-    return jax.tree.map(_g, train_state)
