@@ -11,13 +11,6 @@ from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 
 from bageljax.utils.jax_utils import add_batch_sharding_constraint, is_sharding_active, get_current_mesh
 
-# A more memory saving remat policy than Jax's default if you want to use
-from jax import checkpoint_policies as cpp
-REMAT_POLICY = cpp.save_anything_except_these_names(
-    "dot_general",            # most matmuls (einsum lowers here, too)
-    "dot",                    # legacy small dot
-)
-
 class PatchEmbed(nn.Module):
     """14 × 14 patchifier → (B, L, C)."""
     embed_dim: int = 1152
@@ -37,7 +30,7 @@ class PatchEmbed(nn.Module):
         return x, (h, w)
     
 class MHA(nn.Module):
-    """Multi-head self-attention (flash/SDPA via `dot_product_attention`)."""
+    """Multi-head self-attention"""
     heads: int = 16
     param_dtype: jnp.dtype = jnp.bfloat16
 
@@ -158,13 +151,13 @@ class NaViT(nn.Module):
         x = add_batch_sharding_constraint(x, where="in NaViT")
 
         ScannedViT = nn.scan(
-            # You can checkpoint to reduce compile-time RAM:
+            # Remat the transformer layer
             nn.remat(ViTStep),
             variable_axes={"params": 0},
             split_rngs={"params": True},
             in_axes=(),
             out_axes=None,                      # ys=None from the step
-            length=self.depth,                  # <-- set length here
+            length=self.depth,                  # num transformer layers
             unroll=1,
         )
 
@@ -173,9 +166,6 @@ class NaViT(nn.Module):
         # Call with carry first
         x, _ = layers(x)
 
-        # transformer encoder
-        #for i in range(self.depth):
-        #    x = EncoderBlock(self.heads, self.projection_dim, name=f'block_{i}')(x)
         x = nn.LayerNorm(name='post_vit_ln', dtype=self.param_dtype, param_dtype=self.param_dtype)(x)
         x = add_batch_sharding_constraint(x, where="output of NaViT")
         return x, (hp, wp)

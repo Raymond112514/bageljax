@@ -14,13 +14,6 @@ from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 from bageljax.utils.jax_utils import add_batch_sharding_constraint
 from bageljax.utils.jax_utils import get_current_mesh, is_sharding_active
 
-# A more memory saving remat policy than Jax's default if you want to use
-from jax import checkpoint_policies as cpp
-REMAT_POLICY = cpp.save_anything_except_these_names(
-    "dot_general",            # most matmuls (einsum lowers here, too)
-    "dot",                    # legacy small dot
-)
-
 class RMSNorm(nn.Module):
     eps: float = 1e-6
     param_dtype: jnp.dtype = jnp.bfloat16
@@ -310,19 +303,19 @@ class MixtureOfTransformers(nn.Module):
         cos, sin = rotary_cache(L, self.rope_dim)
 
         ScannedMoT = nn.scan(
-            # You can checkpoint to reduce compile-time RAM:
+            # Remat the transformer layer
             nn.remat(MoTStep),
             variable_axes={"params": 0},
             split_rngs={"params": True},
             in_axes=(broadcast, broadcast, broadcast, broadcast),   # four separate broadcast xs
             out_axes=None,                      # ys=None from the step
-            length=self.depth,                  # <-- set length here
+            length=self.depth,                  # num transformer layers
             unroll=1,
         )
 
         layers = ScannedMoT(name="layers", hidden=self.hidden)
 
-        # Call with carry first, then the four xs (no length kwarg here)
+        # Call with carry first, then the four xs
         x, _ = layers(x, rope_pos_ids, attn_bias, cos, sin)
 
         # ----- final norm -----

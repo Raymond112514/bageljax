@@ -32,7 +32,7 @@ from bageljax.common.optimizers import make_optimizer
 from bageljax.common.typing import Batch, PRNGKey
 from bageljax.data.dataset import glob_to_path_list, Dataset
 from bageljax.utils.timer_utils import Timer
-from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, add_batch_sharding_constraint, enforce_sharding_constraints, unset_context_mesh, reset_context_mesh
+from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, add_batch_sharding_constraint, enforce_sharding_constraints
 from bageljax.model.vocabulary import TokenEmbedder, LogitsHead
 from bageljax.model.vision_encoder import VisionEncoder
 from bageljax.model.mixture_of_transformers import MixtureOfTransformers
@@ -548,13 +548,6 @@ def main(_):
             timer.tick("train")
             train_state, update_info = update(train_state, batch, config, lr_schedule)
             timer.tock("train")
-
-            #def _block(x):
-            #    if isinstance(x, jax.Array):
-            #        x.block_until_ready()
-            #    return None
-
-            #jax.tree_util.tree_map(_block, (train_state, update_info))
 
             timer.tock("total")
 
