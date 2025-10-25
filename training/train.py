@@ -25,7 +25,6 @@ import orbax.checkpoint as ocp
 from flax.training import orbax_utils
 import threading
 from etils import epath
-from flax.training import orbax_utils
 
 from bageljax.common.wandb import WandBLogger
 from bageljax.common.common import TrainState, ModuleDict, nonpytree_field
@@ -522,10 +521,10 @@ def main(_):
     enforce_sharding_constraints(True)
 
     # Build one checkpointer per process (top-level, not per-step).
-    _checkpointer = ocp.AsyncCheckpointer(ocp.StandardCheckpointHandler())
+    #_checkpointer = ocp.AsyncCheckpointer(ocp.StandardCheckpointHandler())
 
     # Optional: a simple lock so you don’t overlap saves on one host.
-    _ckpt_lock = threading.Lock()
+    #_ckpt_lock = threading.Lock()
 
     def _barrier_mesh():
         """Returns the (processes, local_devices) mesh that JAX multihost utils expect."""
@@ -577,7 +576,7 @@ def main(_):
 
             step = i + 1
 
-            if step % FLAGS.config.save_interval == 0 or step == 20:
+            if step % FLAGS.config.save_interval == 0 or step == 100:
                 save_ckpt(save_dir, step, train_state)
 
             if step % FLAGS.config.log_interval == 0:
