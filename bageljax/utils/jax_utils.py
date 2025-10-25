@@ -56,6 +56,13 @@ def add_batch_sharding_constraint(x, *, axis_name='devices', where=''):
     name = f"add_batch_sharding_constraint[{where}]" if where else "add_batch_sharding_constraint"
     return jax.named_call(_constrain, name=name)(x)
 
+def unset_context_mesh():
+    jax.set_mesh(None)
+
+def reset_context_mesh():
+    global _CURRENT_MESH
+    jax.set_mesh(_CURRENT_MESH)
+
 def host_broadcast_str(x: str) -> str:
     """Broadcast_one_to_all, but with a string. Strings should all be the same length."""
     multihost_utils.assert_equal(
@@ -166,15 +173,13 @@ def create_sharding(shard_type, train_state_shape=None):
     return data_sharding, train_state_sharding, no_shard, shard_data, global_to_local
 
 def gather_train_state(train_state):
-    # Function to all-gather sharded arrays
-    def allgather_param(param):
-        if isinstance(param, jax.Array):
-            # Gather sharded array across all processes
-            return process_allgather(param)
+    """All hosts call this; returns a host-NumPy pytree of global arrays."""
+    def _g(x):
+        if isinstance(x, jax.Array):
+            # Assemble the full global array on every host, independent of sharding.
+            gx = multihost_utils.process_allgather(x, tiled=True)
+            return np.asarray(gx)              # host NumPy (legacy checkpoints want this)
         else:
-            return param
-    # Apply the all-gather function to all parameters in the train state
-    gathered_state = jax.tree_util.tree_map(allgather_param, train_state)
-    # Move the gathered parameters to host memory
-    host_state = jax.device_get(gathered_state)
-    return host_state
+            # Non-jax.Array leaves (scalars, small arrays) -> bring to host if needed.
+            return jax.device_get(x)
+    return jax.tree.map(_g, train_state)

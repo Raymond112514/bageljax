@@ -6,7 +6,7 @@ def get_config(config_string):
     base_config = dict(
         num_steps=int(2001000),
         log_interval=100,
-        save_interval=5000,
+        save_interval=7500,
         #eval_interval=5000, # we'll train without a validation set
         save_dir="gs://rail-tpus-pranav/log",
         resume_path=None,
@@ -19,8 +19,8 @@ def get_config(config_string):
 
     base_data_config = dict(
         dataset_path="gs://rail-tpus-pranav/datasets/droid/success",
-        batch_size=8,
-        shuffle_buffer_size=1000,
+        batch_size=16,
+        shuffle_buffer_size=3000,
         chunk_size=16,
         num_parallel_calls=10,
         action_proprio_metadata=dict(

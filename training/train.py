@@ -1,25 +1,9 @@
 import os
-os.environ["FLAX_USE_ORBAX_CHECKPOINTING"] = "0"
-import flax
-flax.config.update("flax_use_orbax_checkpointing", False)
-from flax.training import checkpoints
-
-os.environ.setdefault("JAX_TRACEBACK_FILTERING", "off")  # show JAX internal frames
-os.environ.setdefault("JAX_LOG_COMPILES", "1")           # log every compile
-os.environ.setdefault("JAX_PLATFORMS", "tpu")            # safety: target TPU only
-# Dump HLO / MLIR for the crashing program (pick a writable path)
-os.environ.setdefault("XLA_FLAGS",
-    "--xla_dump_to=/tmp/xla_dumps "
-    "--xla_dump_hlo_as_text "
-    "--xla_dump_hlo_as_proto "
-    "--xla_dump_hlo_as_dot "
-    "--xla_dump_disable_metadata=false "
-    "--xla_dump_include_timestamp=true "
-)
+import jax
+jax.distributed.initialize()
 
 import tensorflow as tf
 from functools import partial
-import jax
 import jax.numpy as jnp
 from jax.experimental import multihost_utils, mesh_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -35,7 +19,13 @@ import random
 import copy
 import datetime
 from einops import rearrange
+import flax
 from flax.training.train_state import TrainState as FlaxTrainState
+import orbax.checkpoint as ocp
+from flax.training import orbax_utils
+import threading
+from etils import epath
+from flax.training import orbax_utils
 
 from bageljax.common.wandb import WandBLogger
 from bageljax.common.common import TrainState, ModuleDict, nonpytree_field
@@ -43,7 +33,7 @@ from bageljax.common.optimizers import make_optimizer
 from bageljax.common.typing import Batch, PRNGKey
 from bageljax.data.dataset import glob_to_path_list, Dataset
 from bageljax.utils.timer_utils import Timer
-from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, gather_train_state, add_batch_sharding_constraint, enforce_sharding_constraints
+from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, gather_train_state, add_batch_sharding_constraint, enforce_sharding_constraints, unset_context_mesh, reset_context_mesh
 from bageljax.model.vocabulary import TokenEmbedder, LogitsHead
 from bageljax.model.vision_encoder import VisionEncoder
 from bageljax.model.mixture_of_transformers import MixtureOfTransformers
@@ -527,9 +517,36 @@ def main(_):
         new_state = new_state.target_update(1 - config["target_update_rate"])
 
         return new_state, info
-           
+        
     # Starting train loop and thus compilation of the main graph; set enforce sharding constraints to true
     enforce_sharding_constraints(True)
+
+    # Build one checkpointer per process (top-level, not per-step).
+    _checkpointer = ocp.AsyncCheckpointer(ocp.StandardCheckpointHandler())
+
+    # Optional: a simple lock so you don’t overlap saves on one host.
+    _ckpt_lock = threading.Lock()
+
+    def _barrier_mesh():
+        """Returns the (processes, local_devices) mesh that JAX multihost utils expect."""
+        devs = np.array(jax.devices()).reshape(jax.process_count(), jax.local_device_count())
+        return jax.sharding.Mesh(devs, ('processes', 'local_devices'))
+
+    def save_ckpt(save_dir: str, step: int, state):
+        """Call on ALL hosts. Orbax will write each host's shards into the same step dir."""
+        step_dir = epath.Path(save_dir) / f"{int(step):08d}"
+        save_args = orbax_utils.save_args_from_target(state)  # build metadata once
+
+        def _worker():
+            # IMPORTANT: use the barrier mesh while calling .save() to avoid device-id mismatch.
+            with _barrier_mesh():
+                # AsyncCheckpointer.save returns immediately; Orbax writes in the background.
+                _checkpointer.save(step_dir, args=ocp.args.StandardSave(state, save_args=save_args))
+
+        # Launch on a clean thread to decouple from any training pjit contexts.
+        with _ckpt_lock:
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
 
     # Train loop
     timer = Timer()
@@ -549,25 +566,19 @@ def main(_):
             train_state, update_info = update(train_state, batch, config, lr_schedule)
             timer.tock("train")
 
-            def _block(x):
-                if isinstance(x, jax.Array):
-                    x.block_until_ready()
-                return None
+            #def _block(x):
+            #    if isinstance(x, jax.Array):
+            #        x.block_until_ready()
+            #    return None
 
-            jax.tree_util.tree_map(_block, (train_state, update_info))
+            #jax.tree_util.tree_map(_block, (train_state, update_info))
 
             timer.tock("total")
 
             step = i + 1
 
-            if step % FLAGS.config.save_interval == 0 or step == 100:
-                on_host_train_state = gather_train_state(train_state)
-                if jax.process_index() == 0:
-                    logging.info("Saving checkpoint...")
-                    checkpoint_path = checkpoints.save_checkpoint(
-                        save_dir, on_host_train_state, step=step, keep=1e7,
-                    )
-                    logging.info("Saved checkpoint to %s", checkpoint_path)
+            if step % FLAGS.config.save_interval == 0 or step == 20:
+                save_ckpt(save_dir, step, train_state)
 
             if step % FLAGS.config.log_interval == 0:
                 if jax.process_index() == 0:

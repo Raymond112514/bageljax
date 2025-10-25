@@ -7,10 +7,16 @@ import flax.linen as nn
 from flax.linen import dot_product_attention
 from einops import rearrange
 import math
-
-from bageljax.model.streaming_attention import streaming_attention
-from bageljax.utils.jax_utils import add_batch_sharding_constraint, is_sharding_active, get_current_mesh
 from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
+
+from bageljax.utils.jax_utils import add_batch_sharding_constraint, is_sharding_active, get_current_mesh
+
+# A more memory saving remat policy than Jax's default if you want to use
+from jax import checkpoint_policies as cpp
+REMAT_POLICY = cpp.save_anything_except_these_names(
+    "dot_general",            # most matmuls (einsum lowers here, too)
+    "dot",                    # legacy small dot
+)
 
 class PatchEmbed(nn.Module):
     """14 × 14 patchifier → (B, L, C)."""
@@ -58,25 +64,7 @@ class MHA(nn.Module):
         k = add_batch_sharding_constraint(k, where="k in ViT MHA")
         v = add_batch_sharding_constraint(v, where="v in ViT MHA")
 
-        # Attention. We set force_fp32_for_softmax=True following standard practice
-        #y = dot_product_attention(
-        #        query=q,
-        #        key=k,
-        #        value=v,
-        #        mask=None,
-        #        dropout_rate=0.0,
-        #        deterministic=True,
-        #        force_fp32_for_softmax=True,
-        #)
-
-        #y = streaming_attention(
-        #    q, k, v,
-        #    bias=None,
-        #    block_size=128,
-        #    out_dtype=jnp.bfloat16,
-        #    accum_dtype=jnp.float32,
-        #)
-
+        # ------- Flash attention ----------------------------------------------------
         sharding_active = is_sharding_active()
 
         if sharding_active:
@@ -139,6 +127,16 @@ class EncoderBlock(nn.Module):
         h = MLP(self.projection_dim, name='mlp')(h)
         return add_batch_sharding_constraint(x + h, where="output of ViT encoder block")
 
+class ViTStep(nn.Module):
+    @nn.compact
+    def __call__(self,
+                 carry: jnp.ndarray):          # carry = x
+        x = EncoderBlock()(
+            carry,
+        )
+        # force no per-step outputs
+        return x, None
+
 class NaViT(nn.Module):
     depth: int = 26
     width: int = 1152
@@ -159,9 +157,25 @@ class NaViT(nn.Module):
         x = x + jnp.take(pos, idx.reshape(-1), axis=0)
         x = add_batch_sharding_constraint(x, where="in NaViT")
 
+        ScannedViT = nn.scan(
+            # You can checkpoint to reduce compile-time RAM:
+            nn.remat(ViTStep),
+            variable_axes={"params": 0},
+            split_rngs={"params": True},
+            in_axes=(),
+            out_axes=None,                      # ys=None from the step
+            length=self.depth,                  # <-- set length here
+            unroll=1,
+        )
+
+        layers = ScannedViT(name="layers")
+
+        # Call with carry first
+        x, _ = layers(x)
+
         # transformer encoder
-        for i in range(self.depth):
-            x = EncoderBlock(self.heads, self.projection_dim, name=f'block_{i}')(x)
+        #for i in range(self.depth):
+        #    x = EncoderBlock(self.heads, self.projection_dim, name=f'block_{i}')(x)
         x = nn.LayerNorm(name='post_vit_ln', dtype=self.param_dtype, param_dtype=self.param_dtype)(x)
         x = add_batch_sharding_constraint(x, where="output of NaViT")
         return x, (hp, wp)
