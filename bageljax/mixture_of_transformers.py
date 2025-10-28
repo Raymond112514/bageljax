@@ -1,13 +1,13 @@
 from __future__ import annotations
 from typing import Optional, Tuple
 import functools as ft
-
 import jax
 import jax.numpy as jnp
 import jax.lax   as lax
 import flax.linen as nn
 from flax.linen import dot_product_attention
-
+from flax.core import broadcast
+from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 
 class RMSNorm(nn.Module):
     eps: float = 1e-6
@@ -170,14 +170,23 @@ class GQA(nn.Module):
         k = jnp.repeat(k, rep, axis=2)
         v = jnp.repeat(v, rep, axis=2)     # shapes (B,L,H,128)
 
-        # ---------- dot-product attention -------------------
-        out = dot_product_attention(
+        # ---------- transpose to prepare for flash attention -------------------
+        q = jnp.transpose(q, (0, 2, 1, 3))
+        k = jnp.transpose(k, (0, 2, 1, 3))
+        v = jnp.transpose(v, (0, 2, 1, 3))
+        
+        # ---------- tile attn_bias on head dim -------------------
+        attn_bias = jnp.tile(attn_bias, (1, H, 1, 1))
+
+        # ---------- flash attention -------------------
+        out = flash_attention(
             q, k, v,
-            bias=attn_bias,
-            dropout_rate=0.0,
-            deterministic=True,
-            force_fp32_for_softmax=True,
+            attn_bias,
+            sm_scale=0.08838834764,
         )
+
+        # ---------- transpose back to head as 2nd to last dim -------------------
+        out = jnp.transpose(out, (0, 2, 1, 3))
 
         # ---------- merge heads & expert-specific out-proj -----------------
         out = out.reshape(B, L, self.hidden)   # (B,L,3584)
@@ -239,6 +248,26 @@ class MoTBlock(nn.Module):
 
         return x + h
 
+class MoTStep(nn.Module):
+    hidden: int
+
+    @nn.compact
+    def __call__(self,
+                 carry: jnp.ndarray,          # carry = x
+                 token_types: jnp.ndarray,
+                 rope_pos_ids: jnp.ndarray,
+                 attn_bias: jnp.ndarray,
+                 cos: jnp.ndarray,
+                 sin: jnp.ndarray):
+        x = MoTBlock(hidden=self.hidden)(
+            carry,
+            token_types=token_types,
+            rope_pos_ids=rope_pos_ids,
+            attn_bias=attn_bias,
+            cos=cos, sin=sin
+        )
+        # force no per-step outputs
+        return x, None
 
 class MixtureOfTransformers(nn.Module):
     depth:      int = 28
@@ -246,10 +275,10 @@ class MixtureOfTransformers(nn.Module):
     rope_dim:   int = 128
 
     def setup(self):
-        self.blocks = [MoTBlock(name=f"layer_{i}") for i in range(self.depth)]
         self.out_rms_txt = RMSNorm(name="txt/final_rms")
         self.out_rms_gen = RMSNorm(name="gen/final_rms")
 
+    @nn.compact
     def __call__(self,
                  x: jnp.ndarray,                  # (B,L,3584)
                  token_types: jnp.ndarray,         # (B,L) 0=pad, 1=text/img, 2=vae
@@ -265,13 +294,21 @@ class MixtureOfTransformers(nn.Module):
         # ---- RoPE tables -------------------------------------------------
         cos, sin = rotary_cache(L, self.rope_dim)  # these will be in float32
 
-        # ---- transformer stack ------------------------------------------
-        for blk in self.blocks:
-            x = blk(x,
-                    token_types=token_types,
-                    rope_pos_ids=rope_pos_ids,
-                    attn_bias=attn_bias,
-                    cos=cos, sin=sin)
+        ScannedMoT = nn.scan(
+            # Remat the transformer layer
+            nn.remat(MoTStep),
+            variable_axes={"params": 0},
+            split_rngs={"params": True},
+            in_axes=(broadcast, broadcast, broadcast, broadcast, broadcast),   # five separate broadcast xs
+            out_axes=None,                      # ys=None from the step
+            length=self.depth,                  # num transformer layers
+            unroll=1,
+        )
+
+        layers = ScannedMoT(name="layers", hidden=self.hidden)
+
+        # Call with carry first, then the five xs
+        x, _ = layers(x, token_types, rope_pos_ids, attn_bias, cos, sin)
 
         # ---- final norm per expert --------------------------------------
         mask_gen = (token_types == 2)[..., None]

@@ -63,7 +63,8 @@ def init_fn(rng):
     H, W = 672, 672 # image height and width, 672 is divisible by 14 and 16
     vae_latent_dim = 16 # VAE latent dimension
     llm_hidden_dim = 3584 # LLM hidden dimension
-    L = 42*42 # sequence length, for llm2vae needs to be (H/16)*(W/16)
+    L = 256 # sequence length, needs to be multiple of 128 for flash attention
+    L_llm2vae = 42 * 42 # custom init seq len for llm2vae, which needs to be (H/16)*(W/16)
 
     params = model_def.init({'params': init_rng},
                                 token_embedder = [
@@ -79,7 +80,7 @@ def init_fn(rng):
                                     jnp.zeros((B, H // 8, W // 8, vae_latent_dim), dtype=jnp.bfloat16),
                                 ],
                                 llm2vae = [
-                                    jnp.zeros((B, L, llm_hidden_dim), dtype=jnp.bfloat16),
+                                    jnp.zeros((B, L_llm2vae, llm_hidden_dim), dtype=jnp.bfloat16),
                                     (H // 16, W // 16),
                                 ],
                                 mixture_of_transformers = [
@@ -104,7 +105,7 @@ rng, key = jax.random.split(rng)
 train_state = jax.jit(init_fn)(key)
 print("Model initialized.")
 
-write_pytree_report(train_state.params, "dump/original.txt", title="BagelVLA (old)")
+write_pytree_report(train_state.params, "dump/new.txt", title="BagelVLA (new)")
 print("Wrote pytree structure to file")
 exit()
 
