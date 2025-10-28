@@ -20,6 +20,7 @@ from bageljax.mixture_of_transformers import MixtureOfTransformers
 from bageljax.common import ModuleDict
 from bageljax.autoencoder import build_autoencoder
 from bageljax.tokenizer import Qwen2Tokenizer, add_special_tokens
+from bageljax.pytree_report import write_pytree_report
 
 # Set up jax compilation cache
 jax.config.update("jax_compilation_cache_dir", "/home/pranav/.jax_compilation_cache")
@@ -102,6 +103,10 @@ rng = jax.random.PRNGKey(SEED)
 rng, key = jax.random.split(rng)
 train_state = jax.jit(init_fn)(key)
 print("Model initialized.")
+
+write_pytree_report(train_state.params, "dump/original.txt", title="BagelVLA (old)")
+print("Wrote pytree structure to file")
+exit()
 
 # Load the checkpoint
 checkpoint_path = "pretrained_weights/bagel"
