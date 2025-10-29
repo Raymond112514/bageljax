@@ -198,3 +198,4 @@ pretrained_weights/
 jax_port/
 tfrecords/
 action_tokenizer_ckpt/
+new_pretrained_weights/
