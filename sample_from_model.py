@@ -77,7 +77,7 @@ def init_fn(rng):
                                     jnp.zeros((B,), dtype=jnp.float32),
                                 ],
                                 vae2llm = [
-                                    jnp.zeros((B, H // 8, W // 8, vae_latent_dim), dtype=jnp.bfloat16),
+                                    jnp.zeros((B, H // 16, W // 16, vae_latent_dim * 4), dtype=jnp.bfloat16),
                                 ],
                                 llm2vae = [
                                     jnp.zeros((B, L_llm2vae, llm_hidden_dim), dtype=jnp.bfloat16),
