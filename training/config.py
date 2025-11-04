@@ -6,12 +6,12 @@ def get_config(config_string):
     base_config = dict(
         num_steps=int(2001000),
         log_interval=100,
-        save_interval=7500,
+        save_interval=10000,
         #eval_interval=5000, # we'll train without a validation set
         save_dir="gs://pranav-europe-west4/log",    #"gs://rail-tpus-pranav/log",
         resume_path=None,
-        pretrained_bagel_path="gs://pranav-europe-west4/log/pretrained_bagel_checkpoint/pretrained_weights/bagel",
-        action_tokenizer_resume_path="gs://pranav-europe-west4/log/fsq_eight_token_tokenizer/checkpoint_10",
+        pretrained_bagel_path="gs://pranav-europe-west4/worldmodelrl_starting_components/new_pretrained_weights/bagel",
+        action_tokenizer_resume_path="gs://pranav-europe-west4/worldmodelrl_starting_components/fsq_actions_16x8/checkpoints/checkpoint_10",
         tokenizer_load_path="/nfs/nfs3/users/pranav/bagel_tokenizer",
         seed=137,
         #num_val_batches=16, # we'll train without a validation set

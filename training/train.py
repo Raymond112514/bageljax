@@ -20,10 +20,9 @@ import copy
 import datetime
 from einops import rearrange
 import flax
-from flax.training.train_state import TrainState as FlaxTrainState
+from flax.core import freeze, unfreeze, FrozenDict
 import orbax.checkpoint as ocp
 from flax.training import orbax_utils
-import threading
 from etils import epath
 
 from bageljax.common.wandb import WandBLogger
@@ -196,24 +195,14 @@ def main(_):
     rng, key = jax.random.split(rng)
     action_tokenizer_train_state = jax.jit(action_tokenizer_init_fn, out_shardings=action_tokenizer_train_state_sharding)(key)
 
+    # Create checkpointer object (used for all subsequent checkpoint loading)
+    checkpointer = ocp.Checkpointer(ocp.StandardCheckpointHandler())
+
     # Load action tokenizer from checkpoint
     # The action tokenizer checkpoint wasn't saved as a train state, but rather just the param pytree
-    # This checkpoint loading process will also include checks to ensure that the params change (meaning the checkpoint is indeed loaded correctly)
-    #loaded_params = checkpoints.restore_checkpoint(
-    #    FLAGS.config.action_tokenizer_resume_path,
-    #    target=action_tokenizer_train_state.params,
-    #)
-    #from flax.traverse_util import flatten_dict
-    #def _flat(d): return {"/".join(k): v for k, v in flatten_dict(d, sep="/").items()}
-    #f_tgt, f_ld = _flat(action_tokenizer_train_state.params), _flat(loaded_params)
-    #missing = [k for k in f_tgt if k not in f_ld]
-    #extra   = [k for k in f_ld if k not in f_tgt]
-    #shape_mismatch = [(k, f_ld[k].shape, f_tgt[k].shape)
-    #                for k in f_ld.keys() & f_tgt.keys()
-    #                if f_ld[k].shape != f_tgt[k].shape]
-    #if missing or extra or shape_mismatch:
-    #    raise ValueError(f"CKPT mismatch. missing={missing[:5]}, extra={extra[:5]}, shape_mismatch={shape_mismatch[:5]}")
-    #action_tokenizer_train_state = action_tokenizer_train_state.replace(params=loaded_params)
+    loaded_action_tokenizer_params = checkpointer.restore(FLAGS.config.action_tokenizer_resume_path, action_tokenizer_train_state.params)
+    action_tokenizer_train_state = action_tokenizer_train_state.replace(params=loaded_action_tokenizer_params)
+    print("Loaded action tokenizer from checkpoint")
 
     # Print number of params of action tokenizer
     print("Total action tokenizer parameters: ", sum([np.prod(v.shape) for v in jax.tree_util.tree_leaves(action_tokenizer_train_state.params)]))
@@ -314,34 +303,32 @@ def main(_):
     train_state = jax.jit(init_fn, out_shardings=train_state_sharding)(key)
 
     # Load from pre-trained Bagel checkpoint
-    # Checkpoint loading requires some extra logic here
-    #print("Loading from pre-trained Bagel checkpoint...")
-    # First delete the proprio projector from the pytree (legacy flax checkpoints doesn't allow the target to have keys the checkpoint doesn't)
-    #proprio_projector_params = train_state.params["modules_proprio_projector"]
-    #del train_state.params["modules_proprio_projector"]
-    # Next construct a Flax TrainState
-    #flax_train_state = FlaxTrainState.create(
-    #    apply_fn=train_state.apply_fn,
-    #    params=train_state.params,
-    #    tx=optax.identity(),
-    #)
-    #flax_train_state = checkpoints.restore_checkpoint(
-    #    FLAGS.config.pretrained_bagel_path,
-    #    target=flax_train_state,
-    #)
-    #flax_train_state.params["modules_proprio_projector"] = proprio_projector_params
-    #train_state = train_state.replace(params=flax_train_state.params)
-    # At this point, everything has been restored correctly, except for the train_state's target parameters
-    # This is a (kinda hacky) fix to properly re-initialize the target params
-    #train_state = train_state.target_update(tau=1.0)
-    #print("Loaded from pre-trained Bagel")
+    # Checkpoint loading is a little complicated
+
+    # Orbax will complain if the target as extra keys, so we must stash the extra key, restore the params, and then put the extra key back
+    # Stash the extra subtree, drop it from the target, restore, then put it back.
+    params_mut = unfreeze(train_state.params)
+    proprio_proj_params = params_mut.pop("modules_proprio_projector")  # KeyError if missing
+
+    reduced_target = freeze(params_mut)  # same structure as target minus the extra key
+    restored_params = checkpointer.restore(FLAGS.config.pretrained_bagel_path, reduced_target)
+
+    # Reinsert the stashed subtree
+    restored_mut = unfreeze(restored_params)
+    restored_mut["modules_proprio_projector"] = proprio_proj_params
+    train_state = train_state.replace(params=freeze(restored_mut))
+
+    # Finally update target params
+    train_state = train_state.target_update(tau=1.0)
+
+    print("Loaded from pre-trained Bagel")
 
     # Load from a previous checkpoint if necessary
     if FLAGS.config.get("resume_path", None) is not None:
         print("Loading from previous checkpoint...")
-        train_state = checkpoints.restore_checkpoint(
+        train_state = checkpointer.restore(
             FLAGS.config.resume_path,
-            target=train_state,
+            train_state,
         )
         print("Loaded from previous checkpoint")
 
@@ -449,6 +436,7 @@ def main(_):
             block_causal = causal | self_attention_mask
             # Now tile to include batch dimension
             block_causal = jnp.tile(block_causal[None, ...], (full_seq.shape[0], 1, 1))
+            block_causal = add_batch_sharding_constraint(block_causal, where="block_causal")
             # padding sees nothing, and is seen by nothing
             padding = jnp.concatenate([jnp.zeros((full_seq.shape[0], 1 + pre_llm_vit_tokens.shape[1]), dtype=bool), jnp.logical_not(batch["text_token_masks"]), jnp.zeros((full_seq.shape[0], action_token_embeds.shape[1]), dtype=bool)], axis=1)
             allowed_attention = jnp.where(padding[:, :, None] | padding[:, None, :], False, block_causal)
@@ -560,8 +548,8 @@ def main(_):
                 if jax.process_index() == 0:
                     update_info = jax.device_get(update_info)
                     wandb_logger.log({"training": update_info}, step=step)
-
                     wandb_logger.log({"timer": timer.get_average_times()}, step=step)
+                    
         except KeyboardInterrupt:
             break
         except tf.errors.OpError as e:
