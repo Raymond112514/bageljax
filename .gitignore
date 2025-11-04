@@ -200,3 +200,4 @@ cython_debug/
 # Custom additions
 tfrecords/
 action_tokenizer_ckpt/
+new_pretrained_weights/
