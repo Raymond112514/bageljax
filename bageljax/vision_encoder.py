@@ -1,8 +1,11 @@
 from typing import Tuple, Dict, Any, Optional
+import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from flax.linen import dot_product_attention
 from einops import rearrange
+import math
+from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 
 class PatchEmbed(nn.Module):
     """14 × 14 patchifier → (B, L, C)."""
@@ -28,8 +31,7 @@ class MHA(nn.Module):
     @nn.compact
     def __call__(self,
                  x: jnp.ndarray,                 # (B, L, D)
-                 *,
-                 mask: Optional[jnp.ndarray] = None):
+                 ):
         B, L, D = x.shape
         H       = self.heads
         d_h     = D // H
@@ -40,20 +42,29 @@ class MHA(nn.Module):
         dense = lambda name: nn.Dense(D, use_bias=True, name=name, dtype=self.param_dtype, param_dtype=self.param_dtype)
 
         # -------- QKV projections ----------------------------------------------------
+        # q = jnp.transpose(dense('q')(x).reshape(B, L, H, d_h), (0, 2, 1, 3))
+        # k = jnp.transpose(dense('k')(x).reshape(B, L, H, d_h), (0, 2, 1, 3))
+        # v = jnp.transpose(dense('v')(x).reshape(B, L, H, d_h), (0, 2, 1, 3))
         q = dense('q')(x).reshape(B, L, H, d_h)
         k = dense('k')(x).reshape(B, L, H, d_h)
         v = dense('v')(x).reshape(B, L, H, d_h)
 
-        # Attention. We set force_fp32_for_softmax=True following standard practice
+        # Flash attention
+        # y = flash_attention(
+        #     q, k, v,
+        #     sm_scale=1.0/math.sqrt(d_h),
+        # )
         y = dot_product_attention(
-                query=q,
-                key=k,
-                value=v,
-                mask=mask,
-                dropout_rate=0.0,
-                deterministic=True,
-                force_fp32_for_softmax=True,
+            query=q,
+            key=k,
+            value=v,
+            dropout_rate=0.0,
+            deterministic=True,
         )
+
+        # Transpose output to put head dim 2nd to last
+        # y = jnp.transpose(y, (0, 2, 1, 3))
+
         # -------- merge heads & output projection -----------------------------------
         y = y.reshape(B, L, D)
         return nn.Dense(D, use_bias=True, name='out', dtype=self.param_dtype, param_dtype=self.param_dtype)(y)
@@ -89,6 +100,16 @@ class EncoderBlock(nn.Module):
         h = MLP(self.projection_dim, name='mlp')(h)
         return x + h
 
+class ViTStep(nn.Module):
+    @nn.compact
+    def __call__(self,
+                 carry: jnp.ndarray):          # carry = x
+        x = EncoderBlock()(
+            carry,
+        )
+        # force no per-step outputs
+        return x, None
+
 class NaViT(nn.Module):
     depth: int = 26
     width: int = 1152
@@ -108,9 +129,20 @@ class NaViT(nn.Module):
         idx = jnp.arange(hp)[:, None] * self.max_grid + jnp.arange(wp)[None, :]
         x = x + jnp.take(pos, idx.reshape(-1), axis=0)
 
-        # transformer encoder
-        for i in range(self.depth):
-            x = EncoderBlock(self.heads, self.projection_dim, name=f'block_{i}')(x)
+        ScannedViT = nn.scan(
+            # Remat the transformer layer
+            nn.remat(ViTStep),
+            variable_axes={"params": 0},
+            split_rngs={"params": True},
+            in_axes=(),
+            out_axes=None,                      # ys=None from the step
+            length=self.depth,                  # num transformer layers
+            unroll=1,
+        )
+        layers = ScannedViT(name="layers")
+        # Call with carry first
+        x, _ = layers(x)
+
         x = nn.LayerNorm(name='post_vit_ln', dtype=self.param_dtype, param_dtype=self.param_dtype)(x)
         return x, (hp, wp)
 
@@ -132,7 +164,7 @@ class ViTConnector(nn.Module):
                                 nn.initializers.normal(0.02, dtype=self.param_dtype),
                                 (self.max_grid ** 2, self.out_dim))
         idx = jnp.arange(hp)[:, None] * self.max_grid + jnp.arange(wp)[None, :]
-        return h + jnp.take(pos_xmodal, idx.reshape(-1), axis=0)
+        return h + jax.lax.stop_gradient(jnp.take(pos_xmodal, idx.reshape(-1), axis=0)) # these embeddings were never learnt, but rather initialized via 2D sin/cos
 
 class VisionEncoder(nn.Module):
     """NHWC pixels  → patch tokens in LLM space (3584-d)."""

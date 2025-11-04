@@ -1,0 +1,79 @@
+BagelVLA (new)
+Generated: 2025-10-28 10:26:43
+Leaves: 67
+
+PATH                                                                                             SHAPE       DTYPE          #ELEMS         BYTES  SHARDING
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+modules_llm2vae/llm2vae/bias                                                                      (64)    bfloat16              64         128 B  SingleDeviceSharding
+modules_llm2vae/llm2vae/kernel                                                               (3584,64)    bfloat16         229,376     448.00 KB  SingleDeviceSharding
+modules_logits_head/weight                                                               (152064,3584)    bfloat16     544,997,376       1.02 GB  SingleDeviceSharding
+modules_mixture_of_transformers/gen/final_rms/weight                                            (3584)    bfloat16           3,584       7.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/gen/k_norm/weight                      (28,128)    bfloat16           3,584       7.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/gen/k_proj/bias                        (28,512)    bfloat16          14,336      28.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/gen/k_proj/kernel                 (28,3584,512)    bfloat16      51,380,224      98.00 MB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/gen/o_proj/kernel                (28,3584,3584)    bfloat16     359,661,568     686.00 MB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/gen/q_norm/weight                      (28,128)    bfloat16           3,584       7.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/gen/q_proj/bias                       (28,3584)    bfloat16         100,352     196.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/gen/q_proj/kernel                (28,3584,3584)    bfloat16     359,661,568     686.00 MB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/gen/v_proj/bias                        (28,512)    bfloat16          14,336      28.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/gen/v_proj/kernel                 (28,3584,512)    bfloat16      51,380,224      98.00 MB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/txt/k_norm/weight                      (28,128)    bfloat16           3,584       7.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/txt/k_proj/bias                        (28,512)    bfloat16          14,336      28.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/txt/k_proj/kernel                 (28,3584,512)    bfloat16      51,380,224      98.00 MB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/txt/o_proj/kernel                (28,3584,3584)    bfloat16     359,661,568     686.00 MB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/txt/q_norm/weight                      (28,128)    bfloat16           3,584       7.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/txt/q_proj/bias                       (28,3584)    bfloat16         100,352     196.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/txt/q_proj/kernel                (28,3584,3584)    bfloat16     359,661,568     686.00 MB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/txt/v_proj/bias                        (28,512)    bfloat16          14,336      28.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/attn/txt/v_proj/kernel                 (28,3584,512)    bfloat16      51,380,224      98.00 MB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/gen/input_rms/weight                       (28,3584)    bfloat16         100,352     196.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/gen/mlp/gen/down_proj/kernel         (28,18944,3584)    bfloat16   1,901,068,288       3.54 GB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/gen/mlp/gen/gate_proj/kernel         (28,3584,18944)    bfloat16   1,901,068,288       3.54 GB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/gen/mlp/gen/up_proj/kernel           (28,3584,18944)    bfloat16   1,901,068,288       3.54 GB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/gen/post_attn_rms/weight                   (28,3584)    bfloat16         100,352     196.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/txt/input_rms/weight                       (28,3584)    bfloat16         100,352     196.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/txt/mlp/txt/down_proj/kernel         (28,18944,3584)    bfloat16   1,901,068,288       3.54 GB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/txt/mlp/txt/gate_proj/kernel         (28,3584,18944)    bfloat16   1,901,068,288       3.54 GB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/txt/mlp/txt/up_proj/kernel           (28,3584,18944)    bfloat16   1,901,068,288       3.54 GB  SingleDeviceSharding
+modules_mixture_of_transformers/layers/MoTBlock_0/txt/post_attn_rms/weight                   (28,3584)    bfloat16         100,352     196.00 KB  SingleDeviceSharding
+modules_mixture_of_transformers/txt/final_rms/weight                                            (3584)    bfloat16           3,584       7.00 KB  SingleDeviceSharding
+modules_time_embedder/mlp/dense0/bias                                                           (3584)    bfloat16           3,584       7.00 KB  SingleDeviceSharding
+modules_time_embedder/mlp/dense0/kernel                                                     (256,3584)    bfloat16         917,504       1.75 MB  SingleDeviceSharding
+modules_time_embedder/mlp/dense1/bias                                                           (3584)    bfloat16           3,584       7.00 KB  SingleDeviceSharding
+modules_time_embedder/mlp/dense1/kernel                                                    (3584,3584)    bfloat16      12,845,056      24.50 MB  SingleDeviceSharding
+modules_token_embedder/weight                                                            (152064,3584)    bfloat16     544,997,376       1.02 GB  SingleDeviceSharding
+modules_vae2llm/pos_embed                                                                  (4096,3584)    bfloat16      14,680,064      28.00 MB  SingleDeviceSharding
+modules_vae2llm/vae2llm/bias                                                                    (3584)    bfloat16           3,584       7.00 KB  SingleDeviceSharding
+modules_vae2llm/vae2llm/kernel                                                               (16,3584)    bfloat16          57,344     112.00 KB  SingleDeviceSharding
+modules_vision_encoder/connector/connector_fc1/bias                                             (3584)    bfloat16           3,584       7.00 KB  SingleDeviceSharding
+modules_vision_encoder/connector/connector_fc1/kernel                                      (1152,3584)    bfloat16       4,128,768       7.88 MB  SingleDeviceSharding
+modules_vision_encoder/connector/connector_fc2/bias                                             (3584)    bfloat16           3,584       7.00 KB  SingleDeviceSharding
+modules_vision_encoder/connector/connector_fc2/kernel                                      (3584,3584)    bfloat16      12,845,056      24.50 MB  SingleDeviceSharding
+modules_vision_encoder/connector/post_vit_pos_embed                                        (4900,3584)    bfloat16      17,561,600      33.50 MB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/ln1/bias                                    (26,1152)    bfloat16          29,952      58.50 KB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/ln1/scale                                   (26,1152)    bfloat16          29,952      58.50 KB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/ln2/bias                                    (26,1152)    bfloat16          29,952      58.50 KB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/ln2/scale                                   (26,1152)    bfloat16          29,952      58.50 KB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/mha/k/bias                                  (26,1152)    bfloat16          29,952      58.50 KB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/mha/k/kernel                           (26,1152,1152)    bfloat16      34,504,704      65.81 MB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/mha/out/bias                                (26,1152)    bfloat16          29,952      58.50 KB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/mha/out/kernel                         (26,1152,1152)    bfloat16      34,504,704      65.81 MB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/mha/q/bias                                  (26,1152)    bfloat16          29,952      58.50 KB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/mha/q/kernel                           (26,1152,1152)    bfloat16      34,504,704      65.81 MB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/mha/v/bias                                  (26,1152)    bfloat16          29,952      58.50 KB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/mha/v/kernel                           (26,1152,1152)    bfloat16      34,504,704      65.81 MB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/mlp/fc1/bias                                (26,4304)    bfloat16         111,904     218.56 KB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/mlp/fc1/kernel                         (26,1152,4304)    bfloat16     128,913,408     245.88 MB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/mlp/fc2/bias                                (26,1152)    bfloat16          29,952      58.50 KB  SingleDeviceSharding
+modules_vision_encoder/vit/layers/EncoderBlock_0/mlp/fc2/kernel                         (26,4304,1152)    bfloat16     128,913,408     245.88 MB  SingleDeviceSharding
+modules_vision_encoder/vit/patch_embed/proj/bias                                                (1152)    bfloat16           1,152       2.25 KB  SingleDeviceSharding
+modules_vision_encoder/vit/patch_embed/proj/kernel                                          (588,1152)    bfloat16         677,376       1.29 MB  SingleDeviceSharding
+modules_vision_encoder/vit/post_vit_ln/bias                                                     (1152)    bfloat16           1,152       2.25 KB  SingleDeviceSharding
+modules_vision_encoder/vit/post_vit_ln/scale                                                    (1152)    bfloat16           1,152       2.25 KB  SingleDeviceSharding
+modules_vision_encoder/vit/pre_vit_pos_embed                                               (4900,1152)    bfloat16       5,644,800      10.77 MB  SingleDeviceSharding
+
+Totals (arrays only):
+  Parameters: 14,607,088,096
+  Memory    : 27.21 GB
+  By dtype:
+    - bfloat16    elems=14,607,088,096  bytes=27.21 GB
