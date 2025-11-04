@@ -4,14 +4,15 @@ import jax.numpy as jnp
 import flax
 from flax import linen as nn
 from typing import Any, Callable, Optional, Tuple
-from flax.training import checkpoints
 from flax.training.train_state import TrainState
 import numpy as np
 import optax
-from copy import deepcopy
 import functools
 from functools import partial
 from PIL import Image
+import orbax.checkpoint as ocp
+from flax.training import orbax_utils
+from etils import epath
 
 from bageljax.vocabulary import TokenEmbedder, LogitsHead
 from bageljax.vision_encoder import VisionEncoder
@@ -32,13 +33,10 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_
 # Hyperparameters
 ################################################
 SEED = 0
-TEXT_2_IMG_MAX_SEQ_LEN = 4350 # max image tokens is 64x64 + 2, a reasonable max prompt tokens is 250 + 2
-IMAGE_EDITING_MAX_SEQ_LEN = 13342 # 250 for prompt, 64x64 for vae, another 64x64 for vae conditioning, 70x70 for vit conditioning
-VQA_MAX_SEQ_LEN = 5500 # 70x70+2 for image, then ~500 token for prompt + generated text
+TEXT_2_IMG_MAX_SEQ_LEN = 4352 # max image tokens is 64x64 + 2, a reasonable max prompt tokens is 250 + 2
+IMAGE_EDITING_MAX_SEQ_LEN = 13312 # 250 for prompt, 64x64 for vae, another 64x64 for vae conditioning, 70x70 for vit conditioning
+VQA_MAX_SEQ_LEN = 5376 # 70x70+2 for image, then ~500 token for prompt + generated text
 PAD_TOKEN_ID = 0 # it doesn't matter what this is
-
-# Prevent flax.checkpoints from using Orbax backend
-flax.config.update('flax_use_orbax_checkpointing', False)
 
 ################################################
 # Initialize the main Bagel model
@@ -105,14 +103,12 @@ rng, key = jax.random.split(rng)
 train_state = jax.jit(init_fn)(key)
 print("Model initialized.")
 
-write_pytree_report(train_state.params, "dump/new.txt", title="BagelVLA (new)")
-print("Wrote pytree structure to file")
-exit()
-
 # Load the checkpoint
-checkpoint_path = "pretrained_weights/bagel"
-train_state = checkpoints.restore_checkpoint(checkpoint_path, target=train_state)
-print("Pre-trained weights loaded.")
+checkpoint_path = "/home/pranav/bageljax/new_pretrained_weights/bagel"
+checkpointer = ocp.Checkpointer(ocp.StandardCheckpointHandler())
+restored_params = checkpointer.restore(checkpoint_path, train_state.params)
+train_state = train_state.replace(params=restored_params)
+print("Bagel weights loaded.")
 
 ################################################
 # Load the autoencoder
@@ -143,8 +139,9 @@ ae_variables = ae.init(key, jnp.zeros((1, 1024, 1024, 3)))
 print("Autoencoder initialized.")
 
 # Load weights for the autoencoder
-ae_checkpoint_path = "pretrained_weights/ae"
-ae_variables = checkpoints.restore_checkpoint(ae_checkpoint_path, target=ae_variables)
+ae_checkpoint_path = "/home/pranav/bageljax/new_pretrained_weights/ae"
+restored_ae_params = checkpointer.restore(ae_checkpoint_path, ae_variables["params"])
+ae_variables = {"params": restored_ae_params}
 print("Autoencoder weights loaded.")
 
 ae_encode = make_jitted_encode(ae)
@@ -153,7 +150,7 @@ ae_decode = make_jitted_decode(ae)
 ################################################
 # Tokenizer
 ################################################
-tokenizer_load_path = "pretrained_weights/tokenizer"
+tokenizer_load_path = "new_pretrained_weights/tokenizer"
 tokenizer = Qwen2Tokenizer.from_pretrained(tokenizer_load_path)
 tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
 
@@ -674,12 +671,12 @@ def image_editing(prompt: str, image: Image):
 # Text + Image -> Text inference function
 ################################################
 def vqa(prompt: str, image: Image):
-    # Resize and normalize the image
-    BASE, MAX_SIDE = 14, 980
+    # Resize and normalize the image. We keep the multiple of 16 so that the number of image tokens is a multiple of 128
+    BASE, MAX_SIDE = 112, 980  # 14 x 16 = 112
     w, h = image.size
     scale = min(MAX_SIDE / w, MAX_SIDE / h, 1.0)  # don't exceed 980; avoids unintended upscaling
     tw, th = int(w * scale), int(h * scale)
-    tw, th = max(BASE, (tw // BASE) * BASE), max(BASE, (th // BASE) * BASE)  # snap down to 14-multiples
+    tw, th = max(BASE, (tw // BASE) * BASE), max(BASE, (th // BASE) * BASE)  # snap down to 112-multiples
     tw, th = min(tw, MAX_SIDE - (MAX_SIDE % BASE)), min(th, MAX_SIDE - (MAX_SIDE % BASE))  # final clamp
     image = image.resize((tw, th), resample=Image.LANCZOS)  # LANCZOS automatcially does antialiased downsampling
 
@@ -811,30 +808,29 @@ def vqa(prompt: str, image: Image):
 ###############################################################
 ######################## Text -> Image ########################
 ###############################################################
-# #prompt = "A female cosplayer portraying an ethereal fairy or elf, wearing a flowing dress made of delicate fabrics in soft, mystical colors like emerald green and silver. She has pointed ears, a gentle, enchanting expression, and her outfit is adorned with sparkling jewels and intricate patterns. The background is a magical forest with glowing plants, mystical creatures, and a serene atmosphere."
-# prompt = "A lantern glowing with green light, photorealistic"
-# gen_img_latent = text2image(prompt, (1024, 1024))
+prompt = "A female cosplayer portraying an ethereal fairy or elf, wearing a flowing dress made of delicate fabrics in soft, mystical colors like emerald green and silver. She has pointed ears, a gentle, enchanting expression, and her outfit is adorned with sparkling jewels and intricate patterns. The background is a magical forest with glowing plants, mystical creatures, and a serene atmosphere."
+gen_img_latent = text2image(prompt, (1024, 1024))
 
-# gen_img = ae_decode(ae_variables, gen_img_latent)
-# gen_img = np.array(gen_img)[0]
-# gen_img = np.clip((gen_img + 1) * 127.5, 0, 255).astype(np.uint8)
-# gen_img = Image.fromarray(gen_img)
+gen_img = ae_decode(ae_variables, gen_img_latent)
+gen_img = np.array(gen_img)[0]
+gen_img = np.clip((gen_img + 1) * 127.5, 0, 255).astype(np.uint8)
+gen_img = Image.fromarray(gen_img)
 
-# gen_img.save("samples/a_green_lantern.png")
+gen_img.save("samples/fairy.png")
 
 ###############################################################
 ######################## Image Editing ########################
 ###############################################################
-# source_image = Image.open("samples/woman.jpg")
-# prompt = "She boards a modern subway, quietly reading a folded newspaper, wearing the same clothes."
-# gen_img_latent = image_editing(prompt, source_image)
+source_image = Image.open("samples/woman.jpg")
+prompt = "She boards a modern subway, quietly reading a folded newspaper, wearing the same clothes."
+gen_img_latent = image_editing(prompt, source_image)
 
-# gen_img = ae_decode(ae_variables, gen_img_latent)
-# gen_img = np.array(gen_img)[0]
-# gen_img = np.clip((gen_img + 1) * 127.5, 0, 255).astype(np.uint8)
-# gen_img = Image.fromarray(gen_img)
+gen_img = ae_decode(ae_variables, gen_img_latent)
+gen_img = np.array(gen_img)[0]
+gen_img = np.clip((gen_img + 1) * 127.5, 0, 255).astype(np.uint8)
+gen_img = Image.fromarray(gen_img)
 
-# gen_img.save("samples/woman_in_subway.png")
+gen_img.save("samples/woman_in_subway.png")
 
 ###############################################################
 ############################# VQA #############################

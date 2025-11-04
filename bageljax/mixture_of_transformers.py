@@ -171,22 +171,28 @@ class GQA(nn.Module):
         v = jnp.repeat(v, rep, axis=2)     # shapes (B,L,H,128)
 
         # ---------- transpose to prepare for flash attention -------------------
-        q = jnp.transpose(q, (0, 2, 1, 3))
-        k = jnp.transpose(k, (0, 2, 1, 3))
-        v = jnp.transpose(v, (0, 2, 1, 3))
+        # q = jnp.transpose(q, (0, 2, 1, 3))
+        # k = jnp.transpose(k, (0, 2, 1, 3))
+        # v = jnp.transpose(v, (0, 2, 1, 3))
         
         # ---------- tile attn_bias on head dim -------------------
-        attn_bias = jnp.tile(attn_bias, (1, H, 1, 1))
+        #attn_bias = jnp.tile(attn_bias, (1, H, 1, 1))
 
         # ---------- flash attention -------------------
-        out = flash_attention(
+        # out = flash_attention(
+        #     q, k, v,
+        #     attn_bias,
+        #     sm_scale=0.08838834764,
+        # )
+        out = dot_product_attention(
             q, k, v,
-            attn_bias,
-            sm_scale=0.08838834764,
+            bias=attn_bias,
+            dropout_rate=0.0,
+            deterministic=True,
         )
 
         # ---------- transpose back to head as 2nd to last dim -------------------
-        out = jnp.transpose(out, (0, 2, 1, 3))
+        # out = jnp.transpose(out, (0, 2, 1, 3))
 
         # ---------- merge heads & expert-specific out-proj -----------------
         out = out.reshape(B, L, self.hidden)   # (B,L,3584)

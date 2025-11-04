@@ -42,18 +42,28 @@ class MHA(nn.Module):
         dense = lambda name: nn.Dense(D, use_bias=True, name=name, dtype=self.param_dtype, param_dtype=self.param_dtype)
 
         # -------- QKV projections ----------------------------------------------------
-        q = jnp.transpose(dense('q')(x).reshape(B, L, H, d_h), (0, 2, 1, 3))
-        k = jnp.transpose(dense('k')(x).reshape(B, L, H, d_h), (0, 2, 1, 3))
-        v = jnp.transpose(dense('v')(x).reshape(B, L, H, d_h), (0, 2, 1, 3))
+        # q = jnp.transpose(dense('q')(x).reshape(B, L, H, d_h), (0, 2, 1, 3))
+        # k = jnp.transpose(dense('k')(x).reshape(B, L, H, d_h), (0, 2, 1, 3))
+        # v = jnp.transpose(dense('v')(x).reshape(B, L, H, d_h), (0, 2, 1, 3))
+        q = dense('q')(x).reshape(B, L, H, d_h)
+        k = dense('k')(x).reshape(B, L, H, d_h)
+        v = dense('v')(x).reshape(B, L, H, d_h)
 
         # Flash attention
-        y = flash_attention(
-            q, k, v,
-            sm_scale=1.0/math.sqrt(d_h),
+        # y = flash_attention(
+        #     q, k, v,
+        #     sm_scale=1.0/math.sqrt(d_h),
+        # )
+        y = dot_product_attention(
+            query=q,
+            key=k,
+            value=v,
+            dropout_rate=0.0,
+            deterministic=True,
         )
 
         # Transpose output to put head dim 2nd to last
-        y = jnp.transpose(y, (0, 2, 1, 3))
+        # y = jnp.transpose(y, (0, 2, 1, 3))
 
         # -------- merge heads & output projection -----------------------------------
         y = y.reshape(B, L, D)
