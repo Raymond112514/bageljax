@@ -35,19 +35,6 @@ class Encoder(nn.Module):
         z = nn.Dense(self.out_dim)(h)
         return jnp.tanh(z)
 
-class Decoder(nn.Module):
-    hidden: int
-    layers: int
-    out_dim: int
-
-    @nn.compact
-    def __call__(self, zq_flat):
-        h = nn.Dense(self.hidden)(zq_flat)
-        for _ in range(self.layers):
-            h = ResMLPBlock(self.hidden)(h)
-        h = nn.LayerNorm()(h)
-        return nn.Dense(self.out_dim)(h)
-
 class ActionTokenizer(nn.Module):
     hidden: int = 768
     layers: int = 8
@@ -62,7 +49,6 @@ class ActionTokenizer(nn.Module):
         self.flat_dim = 16 * 8
 
         self.enc = Encoder(self.hidden, self.layers, self.dims_per_token * self.tokens_per_chunk)
-        self.dec = Decoder(self.hidden, self.layers, self.flat_dim)
 
     def __call__(self, normalized_action_chunks):
         assert normalized_action_chunks.ndim == 3

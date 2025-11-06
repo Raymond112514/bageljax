@@ -11,7 +11,7 @@ def get_config(config_string):
         save_dir="gs://pranav-us-west1/log",
         resume_path=None,
         pretrained_bagel_path="gs://pranav-europe-west4/worldmodelrl_starting_components/half_bagel_weights/bagel",
-        action_tokenizer_resume_path="gs://pranav-europe-west4/worldmodelrl_starting_components/fsq_actions_16x8/checkpoints/checkpoint_10",
+        action_tokenizer_resume_path="gs://pranav-europe-west4/worldmodelrl_starting_components/act_tok_chunk_16_enc_only_ckpt",
         tokenizer_load_path="/nfs/nfs5/users/pranav/bagel_tokenizer",
         seed=137,
         #num_val_batches=16, # we'll train without a validation set

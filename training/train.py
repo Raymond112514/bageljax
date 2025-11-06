@@ -200,9 +200,9 @@ def main(_):
 
     # Load action tokenizer from checkpoint
     # The action tokenizer checkpoint wasn't saved as a train state, but rather just the param pytree
-    #loaded_action_tokenizer_params = checkpointer.restore(FLAGS.config.action_tokenizer_resume_path, action_tokenizer_train_state.params)
-    #action_tokenizer_train_state = action_tokenizer_train_state.replace(params=loaded_action_tokenizer_params)
-    #print("Loaded action tokenizer from checkpoint")
+    loaded_action_tokenizer_params = checkpointer.restore(FLAGS.config.action_tokenizer_resume_path, action_tokenizer_train_state.params)
+    action_tokenizer_train_state = action_tokenizer_train_state.replace(params=loaded_action_tokenizer_params)
+    print("Loaded action tokenizer from checkpoint")
 
     # Print number of params of action tokenizer
     print("Total action tokenizer parameters: ", sum([np.prod(v.shape) for v in jax.tree_util.tree_leaves(action_tokenizer_train_state.params)]))
