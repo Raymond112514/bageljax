@@ -8,17 +8,17 @@ def get_config(config_string):
         log_interval=100,
         save_interval=10000,
         #eval_interval=5000, # we'll train without a validation set
-        save_dir="gs://pranav-europe-west4/log",    #"gs://rail-tpus-pranav/log",
+        save_dir="gs://pranav-us-west1/log",
         resume_path=None,
-        pretrained_bagel_path="gs://pranav-europe-west4/worldmodelrl_starting_components/new_pretrained_weights/bagel",
+        pretrained_bagel_path="gs://pranav-europe-west4/worldmodelrl_starting_components/half_bagel_weights/bagel",
         action_tokenizer_resume_path="gs://pranav-europe-west4/worldmodelrl_starting_components/fsq_actions_16x8/checkpoints/checkpoint_10",
-        tokenizer_load_path="/nfs/nfs3/users/pranav/bagel_tokenizer",
+        tokenizer_load_path="/nfs/nfs5/users/pranav/bagel_tokenizer",
         seed=137,
         #num_val_batches=16, # we'll train without a validation set
     )
 
     base_data_config = dict(
-        dataset_path="gs://pranav-europe-west4/datasets/droid/success",    #"gs://rail-tpus-pranav/datasets/droid/success",
+        dataset_path="gs://pranav-us-west1/datasets/droid/success", 
         batch_size=4,
         shuffle_buffer_size=1000,
         chunk_size=16,

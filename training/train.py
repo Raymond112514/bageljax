@@ -200,9 +200,9 @@ def main(_):
 
     # Load action tokenizer from checkpoint
     # The action tokenizer checkpoint wasn't saved as a train state, but rather just the param pytree
-    loaded_action_tokenizer_params = checkpointer.restore(FLAGS.config.action_tokenizer_resume_path, action_tokenizer_train_state.params)
-    action_tokenizer_train_state = action_tokenizer_train_state.replace(params=loaded_action_tokenizer_params)
-    print("Loaded action tokenizer from checkpoint")
+    #loaded_action_tokenizer_params = checkpointer.restore(FLAGS.config.action_tokenizer_resume_path, action_tokenizer_train_state.params)
+    #action_tokenizer_train_state = action_tokenizer_train_state.replace(params=loaded_action_tokenizer_params)
+    #print("Loaded action tokenizer from checkpoint")
 
     # Print number of params of action tokenizer
     print("Total action tokenizer parameters: ", sum([np.prod(v.shape) for v in jax.tree_util.tree_leaves(action_tokenizer_train_state.params)]))
@@ -307,16 +307,14 @@ def main(_):
 
     # Orbax will complain if the target as extra keys, so we must stash the extra key, restore the params, and then put the extra key back
     # Stash the extra subtree, drop it from the target, restore, then put it back.
-    params_mut = unfreeze(train_state.params)
-    proprio_proj_params = params_mut.pop("modules_proprio_projector")  # KeyError if missing
+    proprio_proj_params = train_state.params["modules_proprio_projector"]
+    del train_state.params["modules_proprio_projector"]
 
-    reduced_target = freeze(params_mut)  # same structure as target minus the extra key
-    restored_params = checkpointer.restore(FLAGS.config.pretrained_bagel_path, reduced_target)
+    restored_params = checkpointer.restore(FLAGS.config.pretrained_bagel_path, train_state.params)
 
     # Reinsert the stashed subtree
-    restored_mut = unfreeze(restored_params)
-    restored_mut["modules_proprio_projector"] = proprio_proj_params
-    train_state = train_state.replace(params=freeze(restored_mut))
+    restored_params["modules_proprio_projector"] = proprio_proj_params
+    train_state = train_state.replace(params=restored_params)
 
     # Finally update target params
     train_state = train_state.target_update(tau=1.0)
