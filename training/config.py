@@ -6,12 +6,12 @@ def get_config(config_string):
     base_config = dict(
         num_steps=int(2001000),
         log_interval=100,
-        save_interval=10000,
+        save_interval=20000,
         #eval_interval=5000, # we'll train without a validation set
         save_dir="gs://pranav-us-west1/log",
         resume_path=None,
-        pretrained_bagel_path="gs://pranav-europe-west4/worldmodelrl_starting_components/half_bagel_weights/bagel",
-        action_tokenizer_resume_path="gs://pranav-europe-west4/worldmodelrl_starting_components/act_tok_chunk_16_enc_only_ckpt",
+        pretrained_bagel_path="gs://pranav-us-west1/worldmodelrl_starting_components/half_bagel_weights/bagel",
+        action_tokenizer_resume_path="gs://pranav-us-west1/worldmodelrl_starting_components/act_tok_chunk_16_enc_only_ckpt",
         tokenizer_load_path="/nfs/nfs5/users/pranav/bagel_tokenizer",
         seed=137,
         #num_val_batches=16, # we'll train without a validation set
@@ -20,7 +20,7 @@ def get_config(config_string):
     base_data_config = dict(
         dataset_path="gs://pranav-us-west1/datasets/droid/success", 
         batch_size=4,
-        shuffle_buffer_size=1000,
+        shuffle_buffer_size=120000,
         chunk_size=16,
         num_parallel_calls=10,
         action_proprio_metadata=dict(

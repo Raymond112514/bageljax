@@ -437,6 +437,7 @@ def main(_):
             block_causal = add_batch_sharding_constraint(block_causal, where="block_causal")
             # padding sees nothing, and is seen by nothing
             padding = jnp.concatenate([jnp.zeros((full_seq.shape[0], 1 + pre_llm_vit_tokens.shape[1]), dtype=bool), jnp.logical_not(batch["text_token_masks"]), jnp.zeros((full_seq.shape[0], action_token_embeds.shape[1]), dtype=bool)], axis=1)
+            padding = add_batch_sharding_constraint(padding, where="padding")
             allowed_attention = jnp.where(padding[:, :, None] | padding[:, None, :], False, block_causal)
             attn_bias = jnp.where(allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
             attn_bias = attn_bias.astype(jnp.bfloat16) # mixed precision is annoying, lol
