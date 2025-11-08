@@ -9,7 +9,7 @@ def get_config(config_string):
         save_interval=20000,
         #eval_interval=5000, # we'll train without a validation set
         save_dir="gs://pranav-us-west1/log",
-        resume_path=None,
+        resume_path="gs://pranav-us-west1/log/worldmodelrl/bagelvla_batch256_chunk16_20251106_162433/00060000",
         pretrained_bagel_path="gs://pranav-us-west1/worldmodelrl_starting_components/half_bagel_weights/bagel",
         action_tokenizer_resume_path="gs://pranav-us-west1/worldmodelrl_starting_components/act_tok_chunk_16_enc_only_ckpt",
         tokenizer_load_path="/nfs/nfs5/users/pranav/bagel_tokenizer",
@@ -20,7 +20,7 @@ def get_config(config_string):
     base_data_config = dict(
         dataset_path="gs://pranav-us-west1/datasets/droid/success", 
         batch_size=4,
-        shuffle_buffer_size=120000,
+        shuffle_buffer_size=100000,
         chunk_size=16,
         num_parallel_calls=10,
         action_proprio_metadata=dict(
