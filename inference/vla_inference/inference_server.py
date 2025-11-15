@@ -31,7 +31,7 @@ INFERENCE_CONFIG = {
     "seed": 0,
     "checkpoint_load_dir": "gs://pranav-us-west1/log/worldmodelrl/bagelvla_batch768_chunk16_20251108_153710/00145000", 
     "tokenizer_load_path": "/nfs/nfs5/users/pranav/bagel_tokenizer",
-    "action_tokenizer_resume_path": "gs://pranav-us-west1/worldmodelrl_starting_components/act_tok_chunk_16_enc_only_ckpt",
+    "action_tokenizer_resume_path": "gs://pranav-us-west1/worldmodelrl_starting_components/act_tok_chunk_16_dec_only_ckpt",
     "max_prompt_length": 226,
     "chunk_size": 16,
     "action_tokens_offset": 150000,
