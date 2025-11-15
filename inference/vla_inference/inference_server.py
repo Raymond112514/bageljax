@@ -1,0 +1,477 @@
+import os
+import jax
+import tensorflow as tf
+from functools import partial
+import jax.numpy as jnp
+import optax
+import numpy as np
+import tqdm
+import traceback
+import random
+import copy
+import datetime
+from einops import rearrange
+import flax
+from flax.core import freeze, unfreeze, FrozenDict
+import orbax.checkpoint as ocp
+from flax.training import orbax_utils
+from etils import epath
+
+from bageljax.common.common import TrainState, ModuleDict, nonpytree_field
+from bageljax.utils.jax_utils import create_sharding, add_batch_sharding_constraint, enforce_sharding_constraints
+from bageljax.model.vocabulary import TokenEmbedder, LogitsHead
+from bageljax.model.vision_encoder import VisionEncoder
+from bageljax.model.mixture_of_transformers import MixtureOfTransformers
+from bageljax.model.tokenizer import Qwen2Tokenizer, add_special_tokens
+from bageljax.model.proprio_projector import ProprioProjector
+from bageljax.model.action_tokenizer import ActionTokenizer
+
+# --------------- all configs/hyperparams for inference are stored here, modify at will ---------------
+INFERENCE_CONFIG = {
+    "seed": 0,
+    "checkpoint_load_dir": "gs://pranav-us-west1/log/worldmodelrl/bagelvla_batch768_chunk16_20251108_153710/00145000", 
+    "tokenizer_load_path": "/nfs/nfs5/users/pranav/bagel_tokenizer",
+    "action_tokenizer_resume_path": "gs://pranav-us-west1/worldmodelrl_starting_components/act_tok_chunk_16_enc_only_ckpt",
+    "max_prompt_length": 226,
+    "chunk_size": 16,
+    "action_tokens_offset": 150000,
+    "action_proprio_metadata": dict(
+        mean=np.array([0.011434038169682026, 0.2440052479505539, -0.013901660218834877, -2.0293116569519043, -0.03873773291707039, 2.3191726207733154, 0.0831032246351242, -0.09849374741315842,], dtype=np.float32),
+        std=np.array([0.31484323740005493, 0.5151926875114441, 0.2791784405708313, 0.5057438611984253, 0.5162752270698547, 0.4621083438396454, 0.7458285093307495, 0.9951376914978027,], dtype=np.float32),
+    ),
+}
+
+# Create the language tokenizer
+tokenizer_load_path = INFERENCE_CONFIG["tokenizer_load_path"]
+tokenizer = Qwen2Tokenizer.from_pretrained(tokenizer_load_path)
+tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
+
+# Function to convert text instruction strings into padded tokens, and adds to the batch 
+# these tokens as well as the token masks and text rope IDs
+def tokenize_and_pad(batch):
+    # What this function is going to do is rewrite the language instruction into:
+    # "What actions should the robot take to complete the following language instruction:\n\n<language_instruction>\n\nActions:"
+    # and then tokenize. It will also left-pad the text to the max length, and assign RoPE IDs.
+
+    PAD_TOKEN_ID = 0 # it doesn't really matter what this is
+    MAX_PROMPT_LENGTH = INFERENCE_CONFIG["max_prompt_length"] + 20 # approx 20 tokens for the prompt filler text
+
+    B = batch["image"].shape[0]
+    batch_tokenized_language = []
+    batch_masks = []
+    batch_text_rope_ids = []
+    for i in range(B):
+        prompt = "What actions should the robot take to complete the following language instruction:\n\n"
+        prompt += batch["language_instruction"][i].decode("utf-8").strip()
+        prompt += "\n\nActions:"
+        prompt_text_ids = tokenizer.encode(prompt)
+        
+        # Add bos and eos tokens
+        prompt_text_ids = [new_token_ids['bos_token_id']] + prompt_text_ids + [new_token_ids['eos_token_id']]
+
+        # Also add the bos token at the end to start action token generation
+        prompt_text_ids = prompt_text_ids + [new_token_ids['bos_token_id']]
+
+        non_pad_tokens_in_prompt = len(prompt_text_ids)
+        assert non_pad_tokens_in_prompt < MAX_PROMPT_LENGTH
+
+        # Pad on the left
+        num_pad_tokens = MAX_PROMPT_LENGTH - non_pad_tokens_in_prompt
+        prompt_text_ids = [PAD_TOKEN_ID] * num_pad_tokens + prompt_text_ids
+        prompt_text_ids = np.array(prompt_text_ids, dtype=np.int32)
+        masks = np.concatenate([np.zeros((num_pad_tokens,), dtype=bool), np.ones((non_pad_tokens_in_prompt,), dtype=bool)]) # false means padding, true means valid text token
+        text_rope_ids = np.concatenate([
+            np.zeros((num_pad_tokens,), dtype=np.int32), # the rope IDs for pad tokens doesn't matter
+            np.arange(non_pad_tokens_in_prompt, dtype=np.int32) + 2, # start from 2, since the image and proprio come before
+        ])
+
+        batch_tokenized_language.append(prompt_text_ids)
+        batch_masks.append(masks)
+        batch_text_rope_ids.append(text_rope_ids)
+
+    batch_tokenized_language = np.stack(batch_tokenized_language)
+    batch_masks = np.stack(batch_masks)
+    batch_text_rope_ids = np.stack(batch_text_rope_ids)
+
+    del batch["language_instruction"]
+    batch["text_tokens"] = batch_tokenized_language
+    batch["text_token_masks"] = batch_masks
+    batch["text_rope_ids"] = batch_text_rope_ids
+
+    return batch
+
+# Initialize rng from config seed
+rng = jax.random.PRNGKey(INFERENCE_CONFIG["seed"])
+
+# We're starting model creation; set enforce sharding constraints to false for this phase
+enforce_sharding_constraints(False)
+
+# Create the FSQ decoder
+# Note, unlike the training script, we're creating the decoder, not the encoder
+checkpointer = ocp.Checkpointer(ocp.StandardCheckpointHandler())
+loaded_action_tokenizer_params = checkpointer.restore(INFERENCE_CONFIG["action_tokenizer_resume_path"], None)
+print(loaded_action_tokenizer_params.keys())
+
+
+
+
+exit()
+
+print("Initializing FSQ action tokenizer...")
+action_tokenizer = ActionTokenizer()
+
+def action_tokenizer_init_fn(rng):
+    rng, init_rng = jax.random.split(rng)
+    params = action_tokenizer.init({'params': init_rng}, jnp.zeros((1, INFERENCE_CONFIG["chunk_size"], 8), dtype=jnp.float32))["params"]
+    rng, create_rng = jax.random.split(rng)
+    state = TrainState.create(
+        apply_fn=action_tokenizer.apply,
+        params=params,
+        txs=None,
+        target_params=None,
+        rng=create_rng,
+        force_f32=True, # this model doesn't use mixed precision
+    )
+    return state
+
+rng, key = jax.random.split(rng)
+action_tokenizer_train_state_shape = jax.eval_shape(action_tokenizer_init_fn, key)
+
+# Create sharding and train_state
+data_sharding, action_tokenizer_train_state_sharding, no_shard, shard_data, global_to_local = create_sharding("fsdp", action_tokenizer_train_state_shape)
+rng, key = jax.random.split(rng)
+action_tokenizer_train_state = jax.jit(action_tokenizer_init_fn, out_shardings=action_tokenizer_train_state_sharding)(key)
+
+# Create checkpointer object (used for all subsequent checkpoint loading)
+checkpointer = ocp.Checkpointer(ocp.StandardCheckpointHandler())
+
+# Load action tokenizer from checkpoint
+# The action tokenizer checkpoint wasn't saved as a train state, but rather just the param pytree
+loaded_action_tokenizer_params = checkpointer.restore(INFERENCE_CONFIG["action_tokenizer_resume_path"], action_tokenizer_train_state.params)
+action_tokenizer_train_state = action_tokenizer_train_state.replace(params=loaded_action_tokenizer_params)
+print("Loaded action tokenizer from checkpoint")
+
+# Print number of params of action tokenizer
+print("Total action tokenizer parameters: ", sum([np.prod(v.shape) for v in jax.tree_util.tree_leaves(action_tokenizer_train_state.params)]))
+
+# Function to replace the action chunks in an assumed sharded batch with action tokens, applying the action tokenizer
+@partial(
+    jax.jit,
+    in_shardings=(action_tokenizer_train_state_sharding, data_sharding),
+    out_shardings=data_sharding,
+)
+def tokenize_action_chunks(action_tokenizer_train_state, batch):
+    action_tokens = action_tokenizer_train_state.apply_fn(
+        {"params": action_tokenizer_train_state.params},
+        normalized_action_chunks=batch["action_chunks"],
+    )
+    assert action_tokens.ndim == 2
+    assert action_tokens.dtype == jnp.int32
+
+    # Add in the vocabulary offset
+    action_tokens = action_tokens + INFERENCE_CONFIG["action_tokens_offset"]
+    action_tokens = add_batch_sharding_constraint(action_tokens, where="action tokenizer output")
+
+    del batch["action_chunks"]
+    batch["action_tokens"] = action_tokens
+
+    return batch
+
+# Initialize the main model
+print("Initializing BagelVLA model...")
+
+networks = {
+    "token_embedder": TokenEmbedder(),
+    "vision_encoder": VisionEncoder(),
+    "mixture_of_transformers": MixtureOfTransformers(),
+    "logits_head": LogitsHead(),
+    "proprio_projector": ProprioProjector(),
+}
+
+model_def = ModuleDict(networks)
+
+def init_fn(rng):
+    rng, init_rng = jax.random.split(rng)
+
+    # For init, let's pick reasonable values of some of the input parameters
+    B = 1 # batch size
+    H, W = 672, 672 # image height and width, 672 is divisible by 14 and 16 ---> no longer needs to be divisible by 16
+    llm_hidden_dim = 3584 # LLM hidden dimension
+    L = 256 # needs to be a multiple of 128 for flash attention
+
+    params = model_def.init({'params': init_rng},
+                                token_embedder = [
+                                    jnp.zeros((B, L), dtype=jnp.int32),
+                                ],
+                                vision_encoder = [
+                                    jnp.zeros((B, H, W, 3), dtype=jnp.bfloat16),
+                                ],
+                                mixture_of_transformers = [
+                                    jnp.zeros((B, L, llm_hidden_dim), dtype=jnp.bfloat16),
+                                    jnp.zeros((B, L), dtype=jnp.int32),
+                                    jnp.zeros((B, 1, L, L), dtype=jnp.bfloat16),
+                                ],
+                                logits_head = [
+                                    jnp.zeros((B, L, llm_hidden_dim), dtype=jnp.bfloat16),
+                                ],
+                                proprio_projector = [
+                                    jnp.zeros((B, 7), dtype=jnp.bfloat16), # remember, proprio is just 7 dimensions because we're not feeding in the gripper dimension
+                                ],
+                            )["params"]
+    rng, create_rng = jax.random.split(rng)
+    train_state = TrainState.create(
+        apply_fn=model_def.apply,
+        params=params,
+        txs=None,
+        target_params=params,
+        rng=create_rng,
+    )
+
+    return train_state
+
+rng, key = jax.random.split(rng)
+train_state_shape = jax.eval_shape(init_fn, key)
+
+# Create sharding and train_state
+data_sharding, train_state_sharding, no_shard, shard_data, global_to_local = create_sharding("fsdp", train_state_shape)
+rng, key = jax.random.split(rng)
+train_state = jax.jit(init_fn, out_shardings=train_state_sharding)(key)
+
+# Load from checkpoint
+print("Loading from previous checkpoint...")
+train_state = checkpointer.restore(
+    INFERENCE_CONFIG["checkpoint_load_dir"],
+    train_state,
+)
+print("Loaded from previous checkpoint")
+
+# Print total number of parameters of the model
+print("Total model parameters: ", sum([np.prod(v.shape) for v in jax.tree_util.tree_leaves(train_state.params)]))
+
+# Create auxiliary objects for use by update function
+config = flax.core.FrozenDict(
+    dict(
+    )
+)
+
+# Define update function
+@partial(
+    jax.jit,
+    in_shardings=(train_state_sharding, data_sharding),
+    out_shardings=(train_state_sharding, no_shard),
+    static_argnames=["config", "lr_schedule"],
+)
+def update(train_state, batch, config, lr_schedule):
+    def loss_fn(params, rng):
+        # Let's start with embedding proprio into the LLM space
+        pre_llm_proprio_token = train_state.apply_fn(
+            {"params": params},
+            proprio=batch["proprio"],
+            name="proprio_projector",
+        )
+        pre_llm_proprio_token = pre_llm_proprio_token[:, None, :] # add a sequence dimension
+        pre_llm_proprio_token = add_batch_sharding_constraint(pre_llm_proprio_token, where="pre_llm_proprio_token")
+
+        # Next the image
+        image = jnp.astype(batch["image"], jnp.float32) / 127.5 - 1
+        image = jnp.astype(image, jnp.bfloat16)
+        image = add_batch_sharding_constraint(image, where="image before vit")
+        
+        # Pass through ViT
+        pre_llm_vit_tokens = train_state.apply_fn(
+            {"params": params},
+            img=image,
+            name="vision_encoder",
+        )
+        pre_llm_vit_tokens = add_batch_sharding_constraint(pre_llm_vit_tokens, where="image after vit")
+
+        # Let's embed the start and end image tokens
+        image_special_token_ids = jnp.array([new_token_ids['start_of_image'], new_token_ids['end_of_image']], dtype=jnp.int32)
+        image_special_token_embeds = train_state.apply_fn(
+            {"params": params},
+            token_ids=image_special_token_ids[None, :],
+            name="token_embedder",
+        )
+        image_special_token_embeds = jnp.tile(image_special_token_embeds, (pre_llm_vit_tokens.shape[0], 1, 1))
+        image_special_token_embeds = add_batch_sharding_constraint(image_special_token_embeds, where="image_special_token_embeds")
+
+        # concat the special image tokens
+        pre_llm_vit_tokens = jnp.concatenate([image_special_token_embeds[:, 0:1], pre_llm_vit_tokens, image_special_token_embeds[:, 1:2]], axis=1)
+        pre_llm_vit_tokens = add_batch_sharding_constraint(pre_llm_vit_tokens, where="pre_llm_vit_tokens")
+
+        # embed the text tokens
+        text_embeds = train_state.apply_fn(
+            {"params": params},
+            token_ids=batch["text_tokens"],
+            name="token_embedder",
+        )
+        text_embeds = add_batch_sharding_constraint(text_embeds, where="text_embeds")
+
+        # Embed the action tokens, dropping the last token (it will only be used as a target)
+        action_tokens = batch["action_tokens"][:, :-1]
+        action_token_embeds = train_state.apply_fn(
+            {"params": params},
+            token_ids=action_tokens,
+            name="token_embedder",
+        )
+        action_token_embeds = add_batch_sharding_constraint(action_token_embeds, where="action_token_embeds")
+
+        # Concat everything along sequence dimension
+        full_seq = jnp.concatenate([pre_llm_proprio_token, pre_llm_vit_tokens, text_embeds, action_token_embeds], axis=1)
+        full_seq = add_batch_sharding_constraint(full_seq, where="full_seq")
+
+        # Prepare full seq rope IDs
+        proprio_and_image_rope_ids = jnp.concatenate([
+            jnp.zeros((1,), dtype=jnp.int32),
+            jnp.ones((pre_llm_vit_tokens.shape[1],), dtype=jnp.int32),
+        ])[None, :]
+        proprio_and_image_rope_ids = jnp.tile(proprio_and_image_rope_ids, (full_seq.shape[0], 1))
+
+        proprio_image_and_text_rope_ids = jnp.concatenate([proprio_and_image_rope_ids, batch["text_rope_ids"]], axis=1)
+        action_rope_ids = jnp.tile((jnp.arange(action_tokens.shape[1], dtype=jnp.int32) + 1)[None, :], (full_seq.shape[0], 1))
+        action_rope_ids = action_rope_ids + proprio_image_and_text_rope_ids[:, -1:]
+        full_seq_rope_ids = jnp.concatenate([proprio_image_and_text_rope_ids, action_rope_ids], axis=1)
+        full_seq_rope_ids = add_batch_sharding_constraint(full_seq_rope_ids, where="full_seq_rope_ids")
+
+        # Now prepare attention masks
+        # To maintain closeness with pretraining, image and text tokens will not see proprio, even though it comes 
+        # before in the sequence. However action tokens will, starting from the bos token
+        L = full_seq.shape[1]
+        # Start with a causal mask
+        causal = jnp.tril(jnp.ones((L, L), dtype=bool))
+        # the first token (proprio) can see itself, but all other tokens, up to the set of action tokens, cannot
+        replacement_first_col = jnp.concatenate([jnp.ones((1,), dtype=bool), jnp.zeros((L-2-action_token_embeds.shape[1],), dtype=bool), jnp.ones((action_token_embeds.shape[1]+1,), dtype=bool)])
+        causal = jnp.concatenate([replacement_first_col[:, None], causal[:, 1:]], axis=1)
+        # Enable full self-attention for vit tokens
+        arr = jnp.concatenate([jnp.zeros((1,), dtype=bool), jnp.ones((pre_llm_vit_tokens.shape[1],), dtype=bool), jnp.zeros((L - pre_llm_vit_tokens.shape[1] - 1), dtype=bool)])
+        self_attention_mask = jnp.matmul(arr[:, None], arr[None, :])
+        block_causal = causal | self_attention_mask
+        # Now tile to include batch dimension
+        block_causal = jnp.tile(block_causal[None, ...], (full_seq.shape[0], 1, 1))
+        block_causal = add_batch_sharding_constraint(block_causal, where="block_causal")
+        # padding sees nothing, and is seen by nothing
+        padding = jnp.concatenate([jnp.zeros((full_seq.shape[0], 1 + pre_llm_vit_tokens.shape[1]), dtype=bool), jnp.logical_not(batch["text_token_masks"]), jnp.zeros((full_seq.shape[0], action_token_embeds.shape[1]), dtype=bool)], axis=1)
+        padding = add_batch_sharding_constraint(padding, where="padding")
+        allowed_attention = jnp.where(padding[:, :, None] | padding[:, None, :], False, block_causal)
+        attn_bias = jnp.where(allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
+        attn_bias = attn_bias.astype(jnp.bfloat16) # mixed precision is annoying, lol
+        attn_bias = add_batch_sharding_constraint(attn_bias, where="attn_bias")
+
+        # Now feed through the LLM
+        post_llm_seq = train_state.apply_fn(
+            {"params": params},
+            x=full_seq,
+            rope_pos_ids=full_seq_rope_ids,
+            attn_bias=attn_bias,
+            name="mixture_of_transformers",
+        )
+        post_llm_seq = add_batch_sharding_constraint(post_llm_seq, where="post_llm_seq")
+
+        # Extract just the action tokens
+        post_llm_action_tokens = post_llm_seq[:, -batch["action_tokens"].shape[1]:]
+
+        # Feed into LLM head
+        action_prediction_logits = train_state.apply_fn(
+            {"params": params},
+            hidden_states=post_llm_action_tokens,
+            name="logits_head",
+        )
+        # this should have shape (B, num_action_tokens, vocab_dim)
+        action_prediction_logits = add_batch_sharding_constraint(action_prediction_logits, where="action_prediction_logits")
+
+        # Construct cross-entropy targets
+        action_token_targets = batch["action_tokens"] # just this, no change needed
+
+        # Critical: loss should be computed in float32
+        action_prediction_logits = jnp.astype(action_prediction_logits, jnp.float32)
+
+        loss = optax.losses.softmax_cross_entropy_with_integer_labels(action_prediction_logits, action_token_targets)
+        loss = add_batch_sharding_constraint(loss, where="loss before pmean")
+        loss = jnp.mean(loss)
+
+        # For logging, let's compute the per-token classification accuracy, and all-token accuracy
+        argmax_prediction_matches = jnp.argmax(action_prediction_logits, axis=-1) == action_token_targets
+        token_accuracy = jnp.mean(argmax_prediction_matches)
+        per_token_accuracies = jnp.mean(argmax_prediction_matches, axis=0)
+        seq_accuracy = jnp.mean(jnp.prod(argmax_prediction_matches, axis=-1))
+
+        log_dict = {
+            "loss": loss,
+            "token_accuracy": token_accuracy,
+            "seq_accuracy": seq_accuracy,
+        }
+        for token_num in range(per_token_accuracies.shape[0]):
+            log_dict[f"token{token_num}_acc"] = per_token_accuracies[token_num]
+
+        return loss, log_dict
+
+    # compute gradients and update params
+    new_state, info = train_state.apply_loss_fns(
+        loss_fn, has_aux=True,
+    )
+
+    # log learning rates
+    info["lr"] = lr_schedule(train_state.step)
+
+    # target update
+    new_state = new_state.target_update(1 - config["target_update_rate"])
+
+    return new_state, info
+    
+# Starting train loop and thus compilation of the main graph; set enforce sharding constraints to true
+enforce_sharding_constraints(True)
+
+# Prepare for checkpointing the model
+checkpointer = ocp.AsyncCheckpointer(ocp.StandardCheckpointHandler())
+
+def save_ckpt(save_dir: str, step: int, train_state):
+    """Asynchronous, multihost-safe save. Call from ALL hosts, outside any mesh context."""
+    step_dir = epath.Path(save_dir) / f"{int(step):08d}"
+    # Describe how to save each leaf (dtype/shape/metadata) without touching array data.
+    save_args = orbax_utils.save_args_from_target(train_state)
+    # Returns immediately; writes happen in the background.
+    checkpointer.save(step_dir, args=ocp.args.StandardSave(train_state, save_args=save_args))
+
+# Train loop
+timer = Timer()
+starting_train_step = int(jax.device_get(train_state.step))
+for i in tqdm.tqdm(range(starting_train_step, FLAGS.config.num_steps)):
+    try:
+        timer.tick("total")
+
+        timer.tick("dataset")
+        batch = next(train_data_iter)
+        batch = tokenize_and_pad(batch)
+        batch = shard_data(batch)
+        batch = tokenize_action_chunks(action_tokenizer_train_state, batch)
+        timer.tock("dataset")
+
+        timer.tick("train")
+        train_state, update_info = update(train_state, batch, config, lr_schedule)
+        timer.tock("train")
+
+        timer.tock("total")
+
+        step = i + 1
+
+        if step % FLAGS.config.save_interval == 0 or step == 20:
+            save_ckpt(save_dir, step, train_state)
+
+        if step % FLAGS.config.log_interval == 0:
+            if jax.process_index() == 0:
+                update_info = jax.device_get(update_info)
+                wandb_logger.log({"training": update_info}, step=step)
+                wandb_logger.log({"timer": timer.get_average_times()}, step=step)
+                
+    except KeyboardInterrupt:
+        break
+    except tf.errors.OpError as e:
+        # sometimes tfds will have trouble communicating with cloud storage bucket for some reason...
+        print(f"Error in iteration {i}: {e}")
+        print("Skipping to next iteration...")
+        traceback.print_exc()
+
+        # to deal with possible untocked timer counts
+        timer.force_tock_everything()
+        
+        continue
