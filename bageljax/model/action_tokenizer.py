@@ -34,6 +34,19 @@ class Encoder(nn.Module):
         h = nn.LayerNorm()(h)
         z = nn.Dense(self.out_dim)(h)
         return jnp.tanh(z)
+    
+class Decoder(nn.Module):
+    hidden: int
+    layers: int
+    out_dim: int
+
+    @nn.compact
+    def __call__(self, zq_flat):
+        h = nn.Dense(self.hidden)(zq_flat)
+        for _ in range(self.layers):
+            h = ResMLPBlock(self.hidden)(h)
+        h = nn.LayerNorm()(h)
+        return nn.Dense(self.out_dim)(h)
 
 class ActionTokenizer(nn.Module):
     hidden: int = 768
@@ -82,3 +95,47 @@ class ActionTokenizer(nn.Module):
 
         return tokens
 
+class ActionDetokenizer(nn.Module):
+    hidden: int = 768
+    layers: int = 8
+
+    def setup(self):
+        self.radices = [32, 32]
+        self.per_token_v = 32 * 32
+        self.dims_per_token = len(self.radices)
+        self.tokens_per_chunk = 8
+        self.radix_mult = jnp.array([1, 32], dtype=jnp.int32)
+        self.grids = [jnp.linspace(-1.0, 1.0, r, dtype=jnp.float32) for r in self.radices]
+        self.chunk_size = 16
+        self.flat_dim = 16 * 8
+
+        self.dec = Decoder(self.hidden, self.layers, self.flat_dim)
+
+    def __call__(self, tokens):
+        assert tokens.dtype == jnp.int32
+        assert tokens.ndim == 2
+
+        B, M = tokens.shape
+        assert M == self.tokens_per_chunk
+
+        def decompose_row(t):
+            digits = []
+            val = t
+            for r in self.radices:
+                d = (val % r).astype(jnp.int32)
+                digits.append(d)
+                val = val // r
+            return jnp.stack(digits, axis=-1)  # (M, D)
+
+        digits = jax.vmap(decompose_row)(tokens)  # (B, M, D)
+        vals = []
+        for j in range(self.dims_per_token):
+            vals.append(self.grids[j][digits[..., j]])  # (B, M)
+        zq = jnp.stack(vals, axis=-1).reshape(B, M * self.dims_per_token)  # (B, M*D)
+
+        recon = self.dec(zq)
+        recon = recon.reshape((B, self.chunk_size, -1))
+
+        return recon
+    
+        # NEXT STEP: compare this code to the train_fsq.py impl

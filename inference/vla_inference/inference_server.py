@@ -108,14 +108,8 @@ enforce_sharding_constraints(False)
 
 # Create the FSQ decoder
 # Note, unlike the training script, we're creating the decoder, not the encoder
-checkpointer = ocp.Checkpointer(ocp.StandardCheckpointHandler())
-loaded_action_tokenizer_params = checkpointer.restore(INFERENCE_CONFIG["action_tokenizer_resume_path"], None)
-print(loaded_action_tokenizer_params.keys())
 
 
-
-
-exit()
 
 print("Initializing FSQ action tokenizer...")
 action_tokenizer = ActionTokenizer()
