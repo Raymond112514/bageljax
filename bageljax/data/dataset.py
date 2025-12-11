@@ -5,103 +5,29 @@ import numpy as np
 import tensorflow as tf
 from absl import logging
 
-
-def glob_to_path_list(
-    glob_strs: Union[str, List[str]], prefix: str = "", exclude: Iterable[str] = ()
-):
-    """Converts a glob string or list of glob strings to a list of paths."""
-    if isinstance(glob_strs, str):
-        glob_strs = [glob_strs]
-    path_list = []
-    for glob_str in glob_strs:
-        paths = tf.io.gfile.glob(f"{prefix}/{glob_str}")
-        filtered_paths = []
-        for path in paths:
-            if not any(fnmatch.fnmatch(path, e) for e in exclude):
-                filtered_paths.append(path)
-            else:
-                logging.info(f"Excluding {path}")
-        if len(filtered_paths) == 0:
-            print("Warning: glob_to_path_list didn't find any paths")
-        path_list += filtered_paths
-    return path_list
-
-@tf.function
-def binarize_gripper_action(x):
-    # Reverse the tensor to process it from the end to the start
-    x_reversed = tf.reverse(x, axis=[0])
-    n = tf.shape(x_reversed)[0]
-
-    # Compute the starts where the current element is zero and the next is non-zero
-    x_reversed_padded = tf.concat([x_reversed[0:1], x_reversed[:-1]], axis=0)
-    starts = tf.cast(
-        (x_reversed_padded == 0.0) & (x_reversed != 0.0),
-        tf.float32
-    )
-
-    # Initialize variables for the loop
-    idx = tf.constant(0)
-    in_sequence = tf.constant(0.0)
-    prev_x = x_reversed[0]
-    mask_ta = tf.TensorArray(dtype=tf.float32, size=n)
-
-    def cond(idx, in_sequence, prev_x, mask_ta):
-        return idx < n
-
-    def body(idx, in_sequence, prev_x, mask_ta):
-        start_flag = starts[idx]
-        x_curr = x_reversed[idx]
-
-        # Start a new sequence if start_flag == 1
-        in_sequence = tf.where(start_flag > 0, 1.0, in_sequence)
-
-        # If in_sequence is True and prev_x >= x_curr, we end the sequence
-        in_sequence = tf.where(
-            (in_sequence > 0) & (prev_x >= x_curr),
-            0.0,
-            in_sequence
-        )
-
-        # The mask is 0 where in_sequence is True, else 1
-        mask_value = tf.where(in_sequence > 0, 0.0, 1.0)
-
-        # Write the mask value
-        mask_ta = mask_ta.write(idx, mask_value)
-
-        idx += 1
-        prev_x = x_curr
-
-        return idx, in_sequence, prev_x, mask_ta
-
-    # Run the loop
-    idx, in_sequence, prev_x, mask_ta = tf.while_loop(
-        cond, body, loop_vars=[idx, in_sequence, prev_x, mask_ta]
-    )
-
-    # Stack the mask and apply it
-    mask = mask_ta.stack()
-    x_zeroed = x_reversed * mask
-
-    # Reverse the result to match the original order
-    result = tf.reverse(x_zeroed, axis=[0])
-
-    # Set all nonzero values to 1, and zero values to -1
-    result = tf.where(result > 0, 1.0, -1.0)
-
-    return result
-
 class Dataset:
+    IMG_KEYS = (
+        "wrist_image", 
+        "shoulder_image_1", 
+        "shoulder_image_2",
+    )
+    F32_KEYS = (
+        "action/cartesian_velocity",
+    )
+    STR_KEYS = (
+        "language_instruction1",
+        "language_instruction2",
+        "language_instruction3",
+    )
+
     def __init__(
         self,
         data_paths: List[Union[str, List[str]]],
         seed: int,
-        action_proprio_metadata: Optional[dict] = None,
-        normalization_type: Optional[str] = "normal",
         sample_weights: Optional[List[float]] = None,
         batch_size: int = 10,
         shuffle_buffer_size: int = 10000,
         train: bool = True,
-        chunk_size: int = 16,
         num_parallel_calls: int = 10,
         **kwargs,
     ):
@@ -114,125 +40,158 @@ class Dataset:
         assert len(data_paths) == len(sample_weights)
         assert np.isclose(sum(sample_weights), 1.0)
 
-        self.action_proprio_metadata = action_proprio_metadata
-        self.normalization_type = normalization_type
-        self.is_train = train
-        self.chunk_size = chunk_size
+        self.is_train = bool(train)
         self.num_parallel_calls = num_parallel_calls
+        # Integer parallelism for non-dataset APIs like tf.map_fn
+        self._map_parallel_iterations = (
+            int(num_parallel_calls) if isinstance(num_parallel_calls, int) else 32
+        )
+        self.shuffle_buffer_size = int(shuffle_buffer_size)
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
 
-        # construct a dataset for each sub-list of paths
-        datasets = []
-        for i, sub_data_paths in enumerate(data_paths):
-            datasets.append(self._construct_tf_dataset(sub_data_paths, seed))
+        # Seed domains: keep different RNG uses separated for clarity.
+        self._path_shuffle_base_seed = self.seed + 101
+        self._subdataset_seed_stride = 1000
+        self._mix_seed = self.seed + 202
+        self._subdataset_shuffle_base_seed = self.seed + 303
 
-        # To allow for a large enough training shuffle buffer, we will not create one for validation
-        if train:
-            for i in range(len(datasets)):
-                datasets[i] = (
-                    datasets[i]
-                    .shuffle(int(shuffle_buffer_size * sample_weights[i]), seed + i)
+        # Build one dataset per sub-dataset
+        sub_datasets = []
+        for i, sub_paths in enumerate(data_paths):
+            # Construct the subdataset
+            sub_ds = self._construct_tf_dataset(
+                sub_paths,
+                subdataset_index=i,
+            )
+
+            # Shuffle each subdataset
+            if self.is_train and self.shuffle_buffer_size > 0:
+                per_ds_buf = max(1, int(self.shuffle_buffer_size * float(sample_weights[i])))
+                shuffle_seed = self._subdataset_shuffle_base_seed + self._subdataset_seed_stride * i
+                sub_ds = sub_ds.shuffle(
+                    buffer_size=per_ds_buf,
+                    seed=shuffle_seed,
+                    reshuffle_each_iteration=True,
                 )
 
-        if train:
-            # repeat the datasets
-            for i in range(len(datasets)):
-                datasets[i] = (
-                    datasets[i]
-                    .repeat()
-                )
+            # For training, repeat each sub-dataset so it never exhausts.
+            if self.is_train:
+                sub_ds = sub_ds.repeat()
 
-        # for validation, we want to be able to iterate through the entire dataset;
-        # for training, we want to make sure that no sub-dataset is ever exhausted
-        # or the sampling ratios will be off. this should never happen because of the
-        # repeat() above, but `stop_on_empty_dataset` is a safeguard, and for validation as 
-        # well it ensures the number of batches we sample is less than the validation size
-        dataset = tf.data.Dataset.sample_from_datasets(
-            datasets, sample_weights, seed=seed, stop_on_empty_dataset=True
+            sub_datasets.append(sub_ds)
+
+        if len(sub_datasets) == 1:
+            dataset = sub_datasets[0]
+        else:
+            # for validation, we want to be able to iterate through the entire dataset;
+            # for training, we want to make sure that no sub-dataset is ever exhausted
+            # or the sampling ratios will be off. this should never happen because of the
+            # repeat() above, but `stop_on_empty_dataset` is a safeguard
+            dataset = tf.data.Dataset.sample_from_datasets(
+                sub_datasets,
+                weights=sample_weights,
+                seed=self._mix_seed,
+                stop_on_empty_dataset=True, 
+            )
+
+        # Batch; drop_remainder=True for stable shapes during training.
+        dataset = dataset.batch(
+            self.batch_size,
+            num_parallel_calls=self.num_parallel_calls,
+            drop_remainder=self.is_train,
+            deterministic=not self.is_train,
         )
 
+        # Dataset-level options: deterministic only for eval.
         opts = tf.data.Options()
         opts.autotune.enabled = True
         opts.experimental_deterministic = not self.is_train
         dataset = dataset.with_options(opts)
-
-        dataset = dataset.batch(
-            batch_size,
-            num_parallel_calls=self.num_parallel_calls,
-            drop_remainder=True,
-            deterministic=not train,
-        )
 
         self.tf_dataset = dataset
 
-    def _construct_tf_dataset(self, paths: List[str], seed: int) -> tf.data.Dataset:
+    # --------------------------------------------------------------------- #
+    # Internal construction of a single (sub-)dataset                       #
+    # --------------------------------------------------------------------- #
+
+    def _expand_and_check_paths(self, sub_paths: List[str]) -> List[str]:
+        """Expand glob patterns, dedup, and sort for stability."""
+        all_paths: List[str] = []
+        for p in sub_paths:
+            matched = tf.io.gfile.glob(p)
+            if not matched:
+                logging.warning("No files match pattern/path: %s", p)
+            all_paths.extend(matched)
+
+        if not all_paths:
+            raise ValueError("No TFRecord files found in data_paths.")
+
+        all_paths = sorted(set(all_paths))
+        return all_paths
+
+    def _construct_tf_dataset(self, paths: List[str], subdataset_index: int,) -> tf.data.Dataset:
         """
-        Constructs a tf.data.Dataset from a list of paths.
+        Constructs a tf.data.Dataset from a list of path/glob strings.
         The dataset yields a dictionary of tensors for each transition.
         """
+        all_paths = self._expand_and_check_paths(paths)
 
-        # shuffle again using the dataset API so the files are read in a
-        # different order every epoch
-        dataset = tf.data.Dataset.from_tensor_slices(paths).shuffle(len(paths), seed)
+        # Dataset of file paths. For training we shuffle + reshuffle each "epoch";
+        # for validation we keep a fixed, sorted order.
+        path_ds = tf.data.Dataset.from_tensor_slices(all_paths)
+        if self.is_train and len(all_paths) > 1:
+            path_seed = self._path_shuffle_base_seed + (
+                self._subdataset_seed_stride * subdataset_index
+            )
+            path_ds = path_ds.shuffle(
+                buffer_size=len(all_paths),
+                seed=path_seed,
+                reshuffle_each_iteration=True,
+            )
 
-        # yields raw serialized examples
-        dataset = tf.data.TFRecordDataset(dataset, num_parallel_reads=self.num_parallel_calls)
-
-        # yields trajectories
-        dataset = dataset.map(self._decode_example, num_parallel_calls=self.num_parallel_calls)
-
-        # yields trajectories
-        dataset = dataset.filter(self._filter_by_len)
-        
-        # yields trajectories
-        dataset = dataset.map(
-           self._process_actions_and_proprio, num_parallel_calls=self.num_parallel_calls
+        # Stream records from all shards in parallel.
+        ds = tf.data.TFRecordDataset(
+            path_ds,
+            num_parallel_reads=self.num_parallel_calls,
         )
 
-        # yields trajectories
-        dataset = dataset.map(self._chunk, num_parallel_calls=self.num_parallel_calls)
-
-        # yields trajectories
-        dataset = dataset.map(self._remove_gripper_from_proprio, num_parallel_calls=self.num_parallel_calls)
-
-        # unbatch to yield individual transitions
-        dataset = dataset.unbatch()
-
-        # yields individual transitions
-        dataset = dataset.map(
-           self._select_language_instr, num_parallel_calls=self.num_parallel_calls
+        # Trajectory-level pipeline -----------------------------------------
+        ds = ds.map(
+            self._decode_example,
+            num_parallel_calls=self.num_parallel_calls,
+        )
+        ds = ds.filter(self._filter_by_len)
+        ds = ds.map(
+            self._add_distances,
+            num_parallel_calls=self.num_parallel_calls,
         )
 
-        # yields individual transitions
-        dataset = dataset.filter(self._lang_filter_fn)
+        # Unbatch to obtain individual transitions.
+        ds = ds.unbatch()
 
-        # yields individual transitions
-        dataset = dataset.map(
-           self._stack_and_reshape_images, num_parallel_calls=self.num_parallel_calls
+        # Example-level pipeline --------------------------------------------
+        ds = ds.map(
+            self._select_language_instr,
+            num_parallel_calls=self.num_parallel_calls,
+        )
+        ds = ds.filter(self._lang_filter_fn)
+        ds = ds.map(
+            self._stack_and_reshape_images,
+            num_parallel_calls=self.num_parallel_calls,
         )
 
-        # To ensure determinism if we're in validation mode
+        # Determinism flag for validation.
         opts = tf.data.Options()
         opts.autotune.enabled = True
         opts.experimental_deterministic = not self.is_train
-        dataset = dataset.with_options(opts)
+        ds = ds.with_options(opts)
 
-        return dataset
-
-    IMG_KEYS = (
-        "wrist_image", 
-        "shoulder_image_1", 
-        "shoulder_image_2",
-    )
-    F32_KEYS = (
-        "action/cartesian_velocity",
-        "observation/robot_state/gripper_position",
-        "observation/robot_state/joint_positions",
-    )
-    STR_KEYS = (
-        "language_instruction1",
-        "language_instruction2",
-        "language_instruction3",
-    )
+        return ds
+    
+    # --------------------------------------------------------------------- #
+    # Decoding / trajectory-level transforms                                #
+    # --------------------------------------------------------------------- #
 
     def _decode_jpeg_sequence(self, jpeg_sparse: tf.SparseTensor) -> tf.Tensor:
         """Sparse list of JPEG-encoded frames -> [T, 288, 512, 3] uint8."""
@@ -248,7 +207,7 @@ class Dataset:
                 lambda b: tf.image.decode_jpeg(b, channels=3),
                 jpegs,
                 fn_output_signature=tf.uint8,
-                parallel_iterations=self.num_parallel_calls,
+                parallel_iterations=self._map_parallel_iterations,
                 infer_shape=True,
             )
 
@@ -282,10 +241,7 @@ class Dataset:
         # Parse serialized float tensors (required); dtype is float32.
         for k in self.F32_KEYS:
             out[k] = tf.io.parse_tensor(parsed[k], out_type=tf.float32)
-            if "gripper" in k:
-                out[k] = tf.ensure_shape(out[k], [None,])
-            else:
-                out[k] = tf.ensure_shape(out[k], [None, None])
+            out[k] = tf.ensure_shape(out[k], [None, None])
 
         # Strings (required)
         for k in self.STR_KEYS:
@@ -324,62 +280,20 @@ class Dataset:
             out[k] = tf.fill([T], out[k])        # -> shape [T]
 
         return out
-
-    ######################### Trajectory level transforms ############################
     
     def _filter_by_len(self, traj):
-        traj_len = tf.shape(traj["observation/robot_state/joint_positions"])[0]
+        traj_len = tf.shape(traj["wrist_image"])[0]
         # Return a boolean indicating whether to keep this example
         return traj_len >= 20
-
-    def _process_actions_and_proprio(self, traj):
-        # Binarize gripper actions
-        gripper_binarized = binarize_gripper_action(traj["observation/robot_state/gripper_position"])
-
-        # Concat gripper with movement
-        movement_and_gripper = tf.concat([traj["observation/robot_state/joint_positions"], gripper_binarized[:, tf.newaxis]], axis=1)
-
-        # Normalize
-        assert self.action_proprio_metadata is not None and self.normalization_type == "normal"
-        mean, std = tf.squeeze(self.action_proprio_metadata["mean"]), tf.squeeze(self.action_proprio_metadata["std"])
-        mean, std = mean[tf.newaxis, :], std[tf.newaxis, :] # add back in trajectory dimension to ensure broadcasting works correctly
-        movement_and_gripper = (movement_and_gripper - mean) / (std + 1e-6) # matches normalization in action tokenizer implementation
-        
-        # Insert into dict
-        traj["proprio"] = movement_and_gripper
-        # We will construct actions later from proprio
-
-        # Delete old keys
-        del traj["observation/robot_state/gripper_position"]
-        del traj["observation/robot_state/joint_positions"]
-
+    
+    def _add_distances(self, traj):
+        T = tf.shape(traj["wrist_image"])[0]
+        traj["distance"] = T - tf.range(T, dtype=tf.int32)
         return traj
 
-    def _chunk(self, traj):
-        traj_len = tf.shape(traj["proprio"])[0]
-        proprio_padded = tf.concat([traj["proprio"], tf.tile(traj["proprio"][-1:, :], (self.chunk_size, 1))], axis=0)
-        
-        def collect_sequences(idx):
-            sequence = tf.gather(proprio_padded, tf.range(idx+1, idx+1+self.chunk_size))
-            return sequence
-        
-        action_chunks = tf.map_fn(
-            collect_sequences, 
-            tf.range(traj_len), 
-            dtype=tf.float32,
-            parallel_iterations=self.num_parallel_calls  # Adjust this based on your hardware capabilities
-        )
-
-        traj["action_chunks"] = action_chunks
-
-        return traj
-
-    def _remove_gripper_from_proprio(self, traj):
-        traj["proprio"] = traj["proprio"][:, :-1]
-
-        return traj
-
-    ######################### Example level transforms ############################
+    # --------------------------------------------------------------------- #
+    # Example-level transforms                                              #
+    # --------------------------------------------------------------------- #
 
     def _select_language_instr(self, transition):
         random_number = tf.random.uniform((1,), maxval=3, dtype=tf.int32)[0]
