@@ -24,7 +24,7 @@ class TokenEmbedder(nn.Module):
 
 
 class LogitsHead(nn.Module):
-    vocab_size: int = 152_064
+    vocab_size: int = 512 # allows for a maximum of 512 unique distances. You don't have to use the full vocab
     hidden_dim: int = 3_584
     init_std: float = 0.02
     param_dtype: jnp.dtype = jnp.bfloat16
