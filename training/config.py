@@ -18,8 +18,8 @@ def get_config(config_string):
 
     base_data_config = dict(
         data_paths=["gs://pranav-us-west1/datasets/droid/success/*.tfrecord"],
-        batch_size=4,
-        shuffle_buffer_size=1000,
+        batch_size=12,
+        shuffle_buffer_size=100000,
         num_parallel_calls=10,
         max_prompt_length=254, # accounts for num tokens in longest prompt, the rewriting of the instruction, and the pad tokens needed to make global seq len a multiple of 128
     )
