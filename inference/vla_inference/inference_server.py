@@ -7,6 +7,7 @@ import numpy as np
 import flax
 from flax.core import FrozenDict
 import orbax.checkpoint as ocp
+from flax.training import orbax_utils
 from etils import epath
 from typing import Dict
 from PIL import Image
@@ -16,7 +17,7 @@ import logging
 import traceback
 import websockets.asyncio.server
 import websockets.frames
-
+import tensorflow as tf
 from bageljax.common.common import TrainState, ModuleDict, nonpytree_field
 from bageljax.utils.jax_utils import create_sharding, add_batch_sharding_constraint, enforce_sharding_constraints
 from bageljax.model.vocabulary import TokenEmbedder, LogitsHead
@@ -27,9 +28,9 @@ from bageljax.utils import msgpack_numpy
 
 INFERENCE_CONFIG = {
     "seed": 0,
-    "checkpoint_load_dir": "gs://path-to-your-value-function-checkpoint",
-    "tokenizer_load_path": "/path/to/your/tokenizer",
-    "max_prompt_length": 226,
+    "checkpoint_load_dir": "gs://raymond-us-west1/value_function/00240000",
+    "tokenizer_load_path": "/nfs/nfs5/users/raymond/bagel_tokenizer",
+    "max_prompt_length": 254,
 }
 
 # Create the language tokenizer
@@ -45,8 +46,7 @@ def tokenize_and_pad(batch):
     # and then tokenize. It will also left-pad the text to the max length, and assign RoPE IDs.
 
     PAD_TOKEN_ID = 0 # it doesn't really matter what this is
-    MAX_PROMPT_LENGTH = FLAGS.config.dataset_kwargs["max_prompt_length"]
-
+    MAX_PROMPT_LENGTH = INFERENCE_CONFIG["max_prompt_length"]
     B = batch["image"].shape[0]
     batch_tokenized_language = []
     batch_masks = []
@@ -151,16 +151,22 @@ rng, key = jax.random.split(rng)
 train_state = jax.jit(init_fn, out_shardings=train_state_sharding)(key)
 
 # Create checkpointer object (used for all subsequent checkpoint loading)
-checkpointer = ocp.Checkpointer(ocp.StandardCheckpointHandler())
+checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
 
-# Load for trained Bagel value function checkpoint
-loaded_value_params = checkpointer.restore(INFERENCE_CONFIG["checkpoint_load_dir"], train_state.params)
-train_state = train_state.replace(params=loaded_value_params)
+restore_args = orbax_utils.restore_args_from_target(train_state.params)
+
+restored_params = checkpointer.restore(
+    INFERENCE_CONFIG["checkpoint_load_dir"],
+    item=train_state.params,
+    restore_args=restore_args,
+)
+
+train_state = train_state.replace(params=restored_params)
+
 print("Loaded value function checkpoint")
 print("Total model parameters: ", sum([np.prod(v.shape) for v in jax.tree_util.tree_leaves(train_state.params)]))
 
 config = flax.core.FrozenDict(dict())
-
 
 # Define the inference function
 @partial(
@@ -267,13 +273,26 @@ class ValueFunction:
     def infer(self, obs: Dict) -> Dict:
         batch = self.preprocess_obs(obs)
         batch = tokenize_and_pad(batch)
+
+        ndev = jax.device_count()
+        b = batch["image"].shape[0]
+        
+        # Ensures that the batch size is divisible by the number of devices
+        if b % ndev != 0:
+            if b == 1:
+                batch = jax.tree_util.tree_map(lambda x: np.repeat(x, ndev, axis=0), batch)
+            else:
+                raise ValueError(
+                    f"Batch size {b} must be divisible by device_count={ndev} for data sharding."
+                )
+
         batch = shard_data(batch)
 
         value_logits = infer(train_state, batch)
         value_logits = np.array(jax.device_get(value_logits))
         assert value_logits.shape[0] == jax.device_count()
-
-        logits = value_logits[0, 0]
+        print(f"Value logits shape: {value_logits.shape}")
+        logits = np.asarray(value_logits, dtype=np.float32)
 
         return {"logits": logits}
     
@@ -286,7 +305,8 @@ class ValueFunction:
         shoulder_and_wrist = tf.concat([shoulder, wrist], axis=0)
         shoulder_and_wrist = tf.ensure_shape(shoulder_and_wrist, [576, 512, 3])
         shoulder_and_wrist = tf.cast(tf.round(tf.image.resize(shoulder_and_wrist, (672, 560), method="bicubic")), tf.uint8)
-        return {"image": shoulder_and_wrist, "language_instruction": instruction}
+        shoulder_and_wrist = tf.expand_dims(shoulder_and_wrist, axis=0)
+        return {"image": shoulder_and_wrist, "language_instruction": [instruction]}
 
     def reset(self, reset_info: Dict) -> None:
         pass

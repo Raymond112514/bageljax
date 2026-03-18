@@ -106,6 +106,10 @@ class TrainState(struct.PyTreeNode):
         return jax.tree_util.tree_map(
             lambda arr: arr.astype(dtype), pytree
         )
+        
+    def make_target_params_bfloat16(self) -> "TrainState":
+        target_params_bf16 = self.cast_to_dtype(self.target_params, dtype=jnp.bfloat16)
+        return self.replace(target_params=target_params_bf16)
 
     def target_update(self, tau: float) -> "TrainState":
         """
