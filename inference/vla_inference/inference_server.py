@@ -28,7 +28,7 @@ from bageljax.utils import msgpack_numpy
 
 INFERENCE_CONFIG = {
     "seed": 0,
-    "checkpoint_load_dir": "gs://raymond-us-west1/value_function/00240000",
+    "checkpoint_load_dir": "gs://raymond-us-west1/value_function/00160000",
     "tokenizer_load_path": "/nfs/nfs5/users/raymond/bagel_tokenizer",
     "max_prompt_length": 254,
 }
@@ -54,6 +54,7 @@ def tokenize_and_pad(batch):
     for i in range(B):
         prompt = "How many timesteps away is the robot from successfully completing the following language instruction:\n\n"
         prompt += batch["language_instruction"][i].decode("utf-8").strip()
+        print(f"Prompt: {prompt}")
         prompt += "\n\nDistance:"
         prompt_text_ids = tokenizer.encode(prompt)
             
@@ -271,46 +272,48 @@ class ValueFunction:
         self.rng = rng
     
     def infer(self, obs: Dict) -> Dict:
+        # Preprocess the observation, then pass it through the tokenizer
         batch = self.preprocess_obs(obs)
         batch = tokenize_and_pad(batch)
 
+        # Check that the batch size is divisible by the number of devices
         ndev = jax.device_count()
         b = batch["image"].shape[0]
-        
-        # Ensures that the batch size is divisible by the number of devices
-        if b % ndev != 0:
-            if b == 1:
-                batch = jax.tree_util.tree_map(lambda x: np.repeat(x, ndev, axis=0), batch)
-            else:
-                raise ValueError(
-                    f"Batch size {b} must be divisible by device_count={ndev} for data sharding."
-                )
+        assert b % ndev == 0, f"Batch size {b} must be divisible by device_count={ndev} for data sharding."
 
+        # Shard the data
         batch = shard_data(batch)
 
-        value_logits = infer(train_state, batch)
-        value_logits = np.array(jax.device_get(value_logits))
-        assert value_logits.shape[0] == jax.device_count()
-        print(f"Value logits shape: {value_logits.shape}")
-        logits = np.asarray(value_logits, dtype=np.float32)
-
+        # Pass through the model and return the logits (B, 512)
+        logits = infer(train_state, batch)
+        logits = np.array(jax.device_get(logits))
+        print(f"Logits shape: {logits.shape}")
+        assert logits.shape[0] == jax.device_count()
+        logits = np.asarray(logits, dtype=np.float32)
         return {"logits": logits}
     
     def preprocess_obs(self, obs: Dict) -> Dict:
+        # The image shape should be (B, 288, 512, 3), and the instruction shape should be a list with length B
         shoulder = obs["shoulder_image"]
+        assert type(shoulder) == np.ndarray
+        assert shoulder.shape[1:] == (288, 512, 3)
+        assert shoulder.dtype == np.uint8
+        
         wrist = obs["wrist_image"]
+        assert type(wrist) == np.ndarray
+        assert wrist.shape[1:] == (288, 512, 3)
+        assert wrist.dtype == np.uint8
+        
         instruction = obs["language_instruction"]
         
         # Concatenate the shoulder and wrist images, copied from dataset.py
-        shoulder_and_wrist = tf.concat([shoulder, wrist], axis=0)
-        shoulder_and_wrist = tf.ensure_shape(shoulder_and_wrist, [576, 512, 3])
+        shoulder_and_wrist = tf.concat([shoulder, wrist], axis=1)
+        shoulder_and_wrist = tf.ensure_shape(shoulder_and_wrist, [None, 576, 512, 3])
         shoulder_and_wrist = tf.cast(tf.round(tf.image.resize(shoulder_and_wrist, (672, 560), method="bicubic")), tf.uint8)
-        shoulder_and_wrist = tf.expand_dims(shoulder_and_wrist, axis=0)
-        return {"image": shoulder_and_wrist, "language_instruction": [instruction]}
+        
+        return {"image": shoulder_and_wrist, "language_instruction": instruction}
 
-    def reset(self, reset_info: Dict) -> None:
-        pass
-
+# Roboarena compatible server config
 @dataclasses.dataclass
 class ValueFunctionServerConfig:
     image_resolution: tuple[int, int] | None = (672, 560)
@@ -321,6 +324,19 @@ class ValueFunctionServerConfig:
     action_space: str = "joint_position"
 
 class WebsocketValueFunctionServer:
+    """
+    Serves the value function using the websocket protocol.
+
+    Interface:
+      Observation:
+        - shoulder_image: (H, W, 3)
+        - wrist_image: (H, W, 3)
+        - language_instruction: str, the natural language task instruction for the policy
+    
+      Return:
+        - logits: (512,), note that during training, only the first 64 logits are trained
+
+    """
     def __init__(
         self,
         value_function: ValueFunction,
@@ -350,9 +366,7 @@ class WebsocketValueFunctionServer:
     async def _handler(self, websocket: websockets.asyncio.server.ServerConnection):
         logging.info(f"Connection from {websocket.remote_address} opened")
         packer = msgpack_numpy.Packer()
-
         await websocket.send(packer.pack(dataclasses.asdict(self._server_config)))
-
         while True:
             try:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
@@ -370,6 +384,7 @@ class WebsocketValueFunctionServer:
                 )
                 raise
 
+# Create the value function, initialize the server,
 rng, value_function_rng = jax.random.split(rng)
 value_function = ValueFunction(rng=value_function_rng)
 server_config = ValueFunctionServerConfig(
