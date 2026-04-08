@@ -31,7 +31,7 @@ from bageljax.common.optimizers import make_optimizer
 from bageljax.common.typing import Batch, PRNGKey
 from bageljax.data.dataset import Dataset
 from bageljax.utils.timer_utils import Timer
-from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, add_batch_sharding_constraint, enforce_sharding_constraints
+from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, add_batch_sharding_constraint, enforce_sharding_constraints, initialize_compilation_cache
 from bageljax.model.vocabulary import TokenEmbedder, LogitsHead
 from bageljax.model.vision_encoder import VisionEncoder
 from bageljax.model.mixture_of_transformers import MixtureOfTransformers
@@ -51,12 +51,19 @@ config_flags.DEFINE_config_file(
     lock_config=False,
 )
 
+def print_green(message):
+    print(f"\033[92m{message}\033[0m")
+
 def main(_):
+    # Initialize JAX compilation cache on a shared GCS path so all workers
+    # load compiled XLA programs on subsequent runs instead of recompiling.
+    initialize_compilation_cache("gs://raymond-us-west1/jax_compilation_cache")
+
     # set up wandb and logging
     wandb_config = WandBLogger.get_default_config()
     wandb_config.update(
         {
-            "project": f"worldmodelrl",
+            "project": f"value_function",
             "exp_descriptor": FLAGS.exp_name,
             "tag": FLAGS.tag,
             "group": FLAGS.group,
@@ -417,6 +424,10 @@ def main(_):
         # Returns immediately; writes happen in the background.
         checkpointer.save(step_dir, args=ocp.args.StandardSave(train_state, save_args=save_args))
 
+    # Synchronize all workers before entering the training loop.
+    # This ensures no worker is ahead of others due to variable initialization time.
+    multihost_utils.sync_global_devices("pre_train_loop")
+
     # Train loop
     timer = Timer()
     starting_train_step = int(jax.device_get(train_state.step))
@@ -439,9 +450,13 @@ def main(_):
             step = i + 1
 
             if step % FLAGS.config.save_interval == 0 or step == 20:
+                print_green(f"[process={jax.process_index()}] About to save checkpoint at step {step}")
+                jax.block_until_ready(train_state)
                 save_ckpt(save_dir, step, train_state)
+                print_green(f"[process={jax.process_index()}] Checkpoint saved at step {step}")
 
             if step % FLAGS.config.log_interval == 0:
+                jax.block_until_ready(train_state)
                 if jax.process_index() == 0:
                     update_info = jax.device_get(update_info)
                     wandb_logger.log({"training": update_info}, step=step)

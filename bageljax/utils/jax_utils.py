@@ -70,12 +70,14 @@ def host_broadcast_str(x: str) -> str:
 def initialize_compilation_cache(
     cache_dir=os.path.expanduser("~/.jax_compilation_cache"),
 ):
-    """Initializes the Jax persistent compilation cache."""
-    pass
+    """Initializes the Jax persistent compilation cache.
 
-    # Right now this function doesn't do anything, but when you implement it, the thing to 
-    # do for multi-host training is to set the compilation cache dir to a google bucket which 
-    # all workers can see
+    For multi-host training, pass a GCS path (e.g. gs://bucket/jax_cache) so all
+    workers share the same cache and only compile once across runs.
+    """
+    from jax.experimental.compilation_cache import compilation_cache as cc
+    cc.initialize_cache(cache_dir)
+    logging.info(f"JAX compilation cache initialized at: {cache_dir}")
 
 
 def create_sharding(shard_type, train_state_shape=None):

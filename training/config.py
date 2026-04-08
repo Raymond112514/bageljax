@@ -4,20 +4,18 @@ import numpy as np
 
 def get_config(config_string):
     base_config = dict(
-        num_steps=int(1001000),
+        num_steps=int(1000000),
         log_interval=100,
-        save_interval=20000,
-        #eval_interval=5000, # we'll train without a validation set
-        save_dir="gs://pranav-us-west1/log",
+        save_interval=1000,
+        save_dir="gs://raymond-us-west1/value_function_logs",
         resume_path=None,
-        pretrained_bagel_path="gs://pranav-us-west1/worldmodelrl_starting_components/value_function_bagel_init/bagel",
-        tokenizer_load_path="/nfs/nfs5/users/pranav/bagel_tokenizer",
+        pretrained_bagel_path="gs://raymond-us-west1/value_function_starting_components/bagel",
+        tokenizer_load_path="/nfs/nfs5/users/raymond/bagel_tokenizer",
         seed=137,
-        #num_val_batches=16, # we'll train without a validation set
     )
 
     base_data_config = dict(
-        data_paths=["gs://pranav-us-west1/datasets/droid/success/*.tfrecord"],
+        data_paths=["gs://raymond-us-west1/droid/success/*.tfrecord"],
         batch_size=12,
         shuffle_buffer_size=100000,
         num_parallel_calls=10,
