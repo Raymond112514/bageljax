@@ -39,7 +39,7 @@ def get_value_function_last_number(path: str) -> str:
 # --------------- all configs/hyperparams for inference are stored here, modify at will ---------------
 INFERENCE_CONFIG = {
     "seed": 0,
-    "checkpoint_load_dir": "gs://pranav-us-west1/log/worldmodelrl/value_function_20251211_233210/00100000", 
+    "checkpoint_load_dir": "gs://pranav-us-west1/log/worldmodelrl/value_function_20251211_233210/00040000", 
     "reduced_checkpoint_save_dir": "gs://raymond-us-west1/value_function",
 }
 INFERENCE_CONFIG["reduced_checkpoint_save_dir"] = f"{INFERENCE_CONFIG['reduced_checkpoint_save_dir']}/{get_value_function_last_number(INFERENCE_CONFIG['checkpoint_load_dir'])}"

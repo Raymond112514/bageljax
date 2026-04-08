@@ -28,7 +28,7 @@ from bageljax.utils import msgpack_numpy
 
 INFERENCE_CONFIG = {
     "seed": 0,
-    "checkpoint_load_dir": "gs://raymond-us-west1/value_function/00160000",
+    "checkpoint_load_dir": "gs://raymond-us-west1/value_function/00040000",
     "tokenizer_load_path": "/nfs/nfs5/users/raymond/bagel_tokenizer",
     "max_prompt_length": 254,
 }
