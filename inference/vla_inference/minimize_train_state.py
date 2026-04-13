@@ -29,20 +29,26 @@ from jax.sharding import Mesh
 from bageljax.common.common import TrainState, ModuleDict, nonpytree_field
 from bageljax.common.optimizers import make_optimizer
 from bageljax.utils.jax_utils import create_sharding, add_batch_sharding_constraint, enforce_sharding_constraints
-from bageljax.model.vocabulary import TokenEmbedder, LogitsHead
+from bageljax.model.vocabulary import TokenEmbedder, LogitsHead, ActionProjector
 from bageljax.model.vision_encoder import VisionEncoder
 from bageljax.model.mixture_of_transformers import MixtureOfTransformers
 
-def get_value_function_last_number(path: str) -> str:
-    return path.rstrip('/').split('/')[-1]
+def get_checkpoint_suffix(path: str) -> str:
+    parts = path.rstrip("/").split("/")
+    if len(parts) >= 2:
+        return "/".join(parts[-2:])
+    return parts[-1]
 
 # --------------- all configs/hyperparams for inference are stored here, modify at will ---------------
 INFERENCE_CONFIG = {
     "seed": 0,
-    "checkpoint_load_dir": "gs://pranav-us-west1/log/worldmodelrl/value_function_20251211_233210/00040000", 
-    "reduced_checkpoint_save_dir": "gs://raymond-us-west1/value_function",
+    "checkpoint_load_dir": "gs://raymond-us-west1/value_function_logs/value_function/value_function_20260408_172143/00020000",
+    "reduced_checkpoint_save_dir": "gs://raymond-us-west1/value_function_bagel_action_cond_checkpoints",
 }
-INFERENCE_CONFIG["reduced_checkpoint_save_dir"] = f"{INFERENCE_CONFIG['reduced_checkpoint_save_dir']}/{get_value_function_last_number(INFERENCE_CONFIG['checkpoint_load_dir'])}"
+INFERENCE_CONFIG["reduced_checkpoint_save_dir"] = (
+    f"{INFERENCE_CONFIG['reduced_checkpoint_save_dir']}/"
+    f"{get_checkpoint_suffix(INFERENCE_CONFIG['checkpoint_load_dir'])}"
+)
 
 # Initialize rng from config seed
 rng = jax.random.PRNGKey(INFERENCE_CONFIG["seed"])
@@ -56,9 +62,12 @@ checkpointer = ocp.Checkpointer(ocp.StandardCheckpointHandler())
 # Initialize the main model (value function)
 print("Initializing Bagel Value Function model...")
 
+ACTION_CHUNK_SIZE = 30
+
 networks = {
     "token_embedder": TokenEmbedder(),
     "vision_encoder": VisionEncoder(),
+    "action_projector": ActionProjector(action_dim=8),
     "mixture_of_transformers": MixtureOfTransformers(),
     "logits_head": LogitsHead(),
 }
@@ -93,6 +102,9 @@ def init_fn(rng):
                                 vision_encoder = [
                                     jnp.zeros((B, H, W, 3), dtype=jnp.bfloat16),
                                 ],
+                                action_projector = [
+                                    jnp.zeros((B, ACTION_CHUNK_SIZE, 8), dtype=jnp.float32),
+                                ],
                                 mixture_of_transformers = [
                                     jnp.zeros((B, L, llm_hidden_dim), dtype=jnp.bfloat16),
                                     jnp.zeros((B, L), dtype=jnp.int32),
@@ -121,7 +133,7 @@ data_sharding, train_state_sharding, no_shard, shard_data, global_to_local = cre
 rng, key = jax.random.split(rng)
 train_state = jax.jit(init_fn, out_shardings=train_state_sharding)(key)
 
-# Load from checkpoint
+# Load the full training checkpoint, then save only the inference weights.
 print("Loading from previous checkpoint...")
 train_state = checkpointer.restore(
     INFERENCE_CONFIG["checkpoint_load_dir"],

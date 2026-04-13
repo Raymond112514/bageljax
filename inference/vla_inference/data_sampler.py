@@ -6,6 +6,13 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import tensorflow as tf
 
+from bageljax.data.action_statistics import (
+    ACTION_NORM_EPS,
+    default_joint_velocity_norm_tensors,
+    normalize_joint_velocity_7d,
+)
+from bageljax.data.dataset import binarize_gripper_action
+
 _TFRECORD_SHARD_RE = re.compile(r"-(\d+)\.tfrecord(?:\..*)?$")
 
 @dataclass(frozen=True)
@@ -15,12 +22,16 @@ class TrajectoryObservation:
       - wrist_image: (T, 288, 512, 3)
       - shoulder_image: (T, 288, 512, 3)
       - language_instruction: (T,)
+      - action/cartesian_velocity: (T, 6)
+      - action/joint_velocity: (T, 8) — 7D joint velocity + binarized gripper (matches training)
       - image: (T, 672, 560, 3), the concatenated shoulder and wrist images
       - distance: (T,)
     """
     wrist_image: np.ndarray
     shoulder_image: np.ndarray
     language_instruction: np.ndarray
+    action_cartesian_velocity: np.ndarray
+    action_joint_8d: np.ndarray
     image: np.ndarray
     distance: np.ndarray
     tfrecord_path: str
@@ -32,6 +43,8 @@ class TrajectoryObservation:
             "wrist_image": self.wrist_image,
             "shoulder_image": self.shoulder_image,
             "language_instruction": self.language_instruction,
+            "action/cartesian_velocity": self.action_cartesian_velocity,
+            "action/joint_velocity": self.action_joint_8d,
             "image": self.image,
             "distance": self.distance,
             "tfrecord_path": self.tfrecord_path,
@@ -51,6 +64,11 @@ class TrajectoryDataSampler:
         "language_instruction1",
         "language_instruction2",
         "language_instruction3",
+    )
+    F32_KEYS = (
+        "action/cartesian_velocity",
+        "action/joint_velocity",
+        "action/gripper_position",
     )
 
     def __init__(
@@ -127,7 +145,7 @@ class TrajectoryDataSampler:
             except StopIteration:
                 break
 
-            traj = self._decode_trajectory(serialized_example)
+            traj, cartesian_tf = self._decode_trajectory(serialized_example)
 
             wrist_T = int(tf.shape(traj["wrist_image"])[0].numpy())
             last_wrist_len = wrist_T
@@ -158,6 +176,8 @@ class TrajectoryDataSampler:
                     wrist_image=wrist.numpy(),
                     shoulder_image=shoulder.numpy(),
                     language_instruction=instruction.numpy(),
+                    action_cartesian_velocity=cartesian_tf.numpy(),
+                    action_joint_8d=traj["action/joint_velocity"].numpy(),
                     image=shoulder_and_wrist.numpy(),
                     distance=distance.numpy(),
                     tfrecord_path=str(tfrecord_path),
@@ -188,13 +208,20 @@ class TrajectoryDataSampler:
         )
         return tf.ensure_shape(frames, [None, 288, 512, 3])
 
-    def _decode_trajectory(self, serialized_example: tf.Tensor) -> Dict[str, tf.Tensor]:
-        """Decode a single TFRecord example into image + language sequences.
+    def _decode_trajectory(
+        self, serialized_example: tf.Tensor
+    ) -> tuple[Dict[str, tf.Tensor], tf.Tensor]:
+        """Decode a single TFRecord example into image, language, and action sequences.
 
-        This decode is intentionally limited to image + language streams for inference.
+        This decode mirrors the training dataset preprocessing closely enough for
+        inference-time replay from recorded trajectories.
+
+        Returns:
+          traj dict (includes action/joint_velocity as [T, 8]) and cartesian velocity [T, 6] before removal.
         """
         feature_spec = {
             **{k: tf.io.VarLenFeature(tf.string) for k in self.IMG_KEYS},
+            **{k: tf.io.FixedLenFeature([], tf.string) for k in self.F32_KEYS},
             **{k: tf.io.FixedLenFeature([], tf.string) for k in self.STR_KEYS},
         }
 
@@ -206,13 +233,57 @@ class TrajectoryDataSampler:
         for k in self.IMG_KEYS:
             out[k] = self._decode_jpeg_sequence(parsed[k])  # [T, 288, 512, 3]
 
+        # Parse serialized float tensors.
+        for k in self.F32_KEYS:
+            out[k] = tf.io.parse_tensor(parsed[k], out_type=tf.float32)
+            if k == "action/gripper_position":
+                out[k] = tf.reshape(out[k], [-1])
+            else:
+                out[k] = tf.ensure_shape(out[k], [None, None])
+
         # Strings: scalar.
         for k in self.STR_KEYS:
             out[k] = parsed[k]  # scalar tf.string
+
+        # Ensure the action sequence length matches the image sequence length.
+        T = tf.shape(out[self.IMG_KEYS[0]])[0]
+        for k in self.F32_KEYS:
+            with tf.control_dependencies([
+                tf.debugging.assert_equal(
+                    tf.shape(out[k])[0], T, message=f"{k} length != image T"
+                )
+            ]):
+                out[k] = tf.identity(out[k])
+
+        # Apply the same stop-action mask as training so action-conditioned
+        # inference replays the same filtered timesteps.
+        a_cartesian_velocity = out["action/cartesian_velocity"]
+        vec3 = a_cartesian_velocity[..., :3]
+        xyz_action_se = tf.reduce_sum(tf.square(vec3), axis=-1)
+        mask = xyz_action_se > 1e-3
+
+        for k in self.IMG_KEYS:
+            out[k] = tf.boolean_mask(out[k], mask, axis=0)
+        for k in self.F32_KEYS:
+            out[k] = tf.boolean_mask(out[k], mask, axis=0)
+
+        cartesian_for_return = out["action/cartesian_velocity"]
+        del out["action/cartesian_velocity"]
+        grip_bin = binarize_gripper_action(out["action/gripper_position"])
+        del out["action/gripper_position"]
+        jv = out["action/joint_velocity"]
+        jv_mean, jv_std = default_joint_velocity_norm_tensors()
+        jv = normalize_joint_velocity_7d(
+            jv,
+            jv_mean,
+            jv_std,
+            tf.constant(ACTION_NORM_EPS, dtype=tf.float32),
+        )
+        out["action/joint_velocity"] = tf.concat([jv, grip_bin[:, tf.newaxis]], axis=-1)
 
         # Repeat language strings to shape [T].
         T = tf.shape(out[self.IMG_KEYS[0]])[0]
         for k in self.STR_KEYS:
             out[k] = tf.fill([T], out[k])
 
-        return out
+        return out, cartesian_for_return

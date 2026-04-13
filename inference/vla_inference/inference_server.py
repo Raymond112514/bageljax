@@ -20,7 +20,7 @@ import websockets.frames
 import tensorflow as tf
 from bageljax.common.common import TrainState, ModuleDict, nonpytree_field
 from bageljax.utils.jax_utils import create_sharding, add_batch_sharding_constraint, enforce_sharding_constraints
-from bageljax.model.vocabulary import TokenEmbedder, LogitsHead
+from bageljax.model.vocabulary import TokenEmbedder, LogitsHead, ActionProjector
 from bageljax.model.vision_encoder import VisionEncoder
 from bageljax.model.mixture_of_transformers import MixtureOfTransformers
 from bageljax.model.tokenizer import Qwen2Tokenizer, add_special_tokens
@@ -28,9 +28,10 @@ from bageljax.utils import msgpack_numpy
 
 INFERENCE_CONFIG = {
     "seed": 0,
-    "checkpoint_load_dir": "gs://raymond-us-west1/value_function/00040000",
+    "checkpoint_load_dir": "gs://raymond-us-west1/value_function_bagel_action_cond_checkpoints/value_function_20260408_172143/00020000",
     "tokenizer_load_path": "/nfs/nfs5/users/raymond/bagel_tokenizer",
-    "max_prompt_length": 254,
+    "max_prompt_length": 224,
+    "action_chunk_size": 30,  # must match training; seq len = N_img + K + max_prompt_length
 }
 
 # Create the language tokenizer
@@ -73,8 +74,8 @@ def tokenize_and_pad(batch):
         prompt_text_ids = np.array(prompt_text_ids, dtype=np.int32)
         masks = np.concatenate([np.zeros((num_pad_tokens,), dtype=bool), np.ones((non_pad_tokens_in_prompt,), dtype=bool)]) # false means padding, true means valid text token
         text_rope_ids = np.concatenate([
-            np.zeros((num_pad_tokens,), dtype=np.int32), # the rope IDs for pad tokens doesn't matter
-            np.arange(non_pad_tokens_in_prompt, dtype=np.int32) + 1, # start from 1, since the image comes before
+            np.zeros((num_pad_tokens,), dtype=np.int32),
+            np.arange(non_pad_tokens_in_prompt, dtype=np.int32) + 1,
         ])
 
         batch_tokenized_language.append(prompt_text_ids)
@@ -100,6 +101,7 @@ print("Initializing Bagel Value Function model...")
 networks = {
     "token_embedder": TokenEmbedder(),
     "vision_encoder": VisionEncoder(),
+    "action_projector": ActionProjector(action_dim=8),
     "mixture_of_transformers": MixtureOfTransformers(),
     "logits_head": LogitsHead(),
 }
@@ -122,6 +124,12 @@ def init_fn(rng):
         ],
         vision_encoder=[
             jnp.zeros((B, H, W, 3), dtype=jnp.bfloat16),
+        ],
+        action_projector=[
+            jnp.zeros(
+                (B, INFERENCE_CONFIG["action_chunk_size"], 8),
+                dtype=jnp.float32,
+            ),
         ],
         mixture_of_transformers=[
             jnp.zeros((B, L, llm_hidden_dim), dtype=jnp.bfloat16),
@@ -199,6 +207,14 @@ def infer(train_state, batch):
     pre_llm_vit_tokens = jnp.concatenate([image_special_token_embeds[:, 0:1], pre_llm_vit_tokens, image_special_token_embeds[:, 1:2]], axis=1)
     pre_llm_vit_tokens = add_batch_sharding_constraint(pre_llm_vit_tokens, where="pre_llm_vit_tokens")
 
+    # Project action chunk (7D velocity + binarized gripper per step) to token embeddings.
+    action_tokens = train_state.apply_fn(
+        {"params": train_state.params},
+        action=batch["action/joint_velocity_chunk"],
+        name="action_projector",
+    )
+    action_tokens = add_batch_sharding_constraint(action_tokens, where="action_tokens")
+
     # embed the text tokens
     text_embeds = train_state.apply_fn(
         {"params": train_state.params},
@@ -207,30 +223,40 @@ def infer(train_state, batch):
     )
     text_embeds = add_batch_sharding_constraint(text_embeds, where="text_embeds")
 
-    # Concat everything along the sequence dimension
-    full_seq = jnp.concatenate([pre_llm_vit_tokens, text_embeds], axis=1)
+    # [img_tokens | action_tokens | text_tokens]
+    full_seq = jnp.concatenate([pre_llm_vit_tokens, action_tokens, text_embeds], axis=1)
     full_seq = add_batch_sharding_constraint(full_seq, where="full_seq")
 
-    # Prepare the full seq rope ids
-    image_rope_ids = jnp.zeros((pre_llm_vit_tokens.shape[1],), dtype=jnp.int32)[None, :]
+    n_img = pre_llm_vit_tokens.shape[1]
+    n_action = action_tokens.shape[1]
+    image_rope_ids = jnp.zeros((n_img,), dtype=jnp.int32)[None, :]
     image_rope_ids = jnp.tile(image_rope_ids, (full_seq.shape[0], 1))
-
-    full_seq_rope_ids = jnp.concatenate([image_rope_ids, batch["text_rope_ids"]], axis=1)
+    action_rope_ids = (jnp.arange(n_action, dtype=jnp.int32) + 1)[None, :]
+    action_rope_ids = jnp.tile(action_rope_ids, (full_seq.shape[0], 1))
+    text_rope_ids = jnp.where(
+        batch["text_token_masks"],
+        batch["text_rope_ids"] + n_action,
+        0,
+    )
+    full_seq_rope_ids = jnp.concatenate([image_rope_ids, action_rope_ids, text_rope_ids], axis=1)
     full_seq_rope_ids = add_batch_sharding_constraint(full_seq_rope_ids, where="full_seq_rope_ids")
 
     # Now prepare attention masks
     L = full_seq.shape[1]
-    # Start with a causal mask
     causal = jnp.tril(jnp.ones((L, L), dtype=bool))
-    # Enable full self-attention for vit tokens
-    arr = jnp.concatenate([jnp.ones((pre_llm_vit_tokens.shape[1],), dtype=bool), jnp.zeros((L - pre_llm_vit_tokens.shape[1]), dtype=bool)])
+    arr = jnp.concatenate([jnp.ones((n_img,), dtype=bool), jnp.zeros((L - n_img,), dtype=bool)])
     self_attention_mask = jnp.matmul(arr[:, None], arr[None, :])
     block_causal = causal | self_attention_mask
-    # Now tile to include batch dimension
     block_causal = jnp.tile(block_causal[None, ...], (full_seq.shape[0], 1, 1))
     block_causal = add_batch_sharding_constraint(block_causal, where="block_causal")
-    # padding sees nothing, and is seen by nothing
-    padding = jnp.concatenate([jnp.zeros((full_seq.shape[0], pre_llm_vit_tokens.shape[1]), dtype=bool), jnp.logical_not(batch["text_token_masks"])], axis=1)
+    padding = jnp.concatenate(
+        [
+            jnp.zeros((full_seq.shape[0], n_img), dtype=bool),
+            jnp.zeros((full_seq.shape[0], n_action), dtype=bool),
+            jnp.logical_not(batch["text_token_masks"]),
+        ],
+        axis=1,
+    )
     padding = add_batch_sharding_constraint(padding, where="padding")
     allowed_attention = jnp.where(padding[:, :, None] | padding[:, None, :], False, block_causal)
     attn_bias = jnp.where(allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
@@ -246,6 +272,7 @@ def infer(train_state, batch):
         name="mixture_of_transformers",
     )
     post_llm_seq = add_batch_sharding_constraint(post_llm_seq, where="post_llm_seq")
+    print(f"Post LLM seq shape: {post_llm_seq.shape}")
 
     # Extract just the last token
     post_llm_value_token = post_llm_seq[:, -1:]
@@ -287,13 +314,12 @@ class ValueFunction:
         # Pass through the model and return the logits (B, 512)
         logits = infer(train_state, batch)
         logits = np.array(jax.device_get(logits))
-        print(f"Logits shape: {logits.shape}")
-        assert logits.shape[0] == jax.device_count()
         logits = np.asarray(logits, dtype=np.float32)
         return {"logits": logits}
     
     def preprocess_obs(self, obs: Dict) -> Dict:
-        # The image shape should be (B, 288, 512, 3), and the instruction shape should be a list with length B
+        # The image shape should be (B, 288, 512, 3), and the instruction shape
+        # should be a list with length B.
         shoulder = obs["shoulder_image"]
         assert type(shoulder) == np.ndarray
         assert shoulder.shape[1:] == (288, 512, 3)
@@ -305,13 +331,23 @@ class ValueFunction:
         assert wrist.dtype == np.uint8
         
         instruction = obs["language_instruction"]
-        
+        # (B, K, 8): 7D joint velocity + binarized gripper per timestep, same as training.
+        action_chunk = obs["action/joint_velocity_chunk"]
+        assert type(action_chunk) == np.ndarray
+        assert action_chunk.ndim == 3 and action_chunk.shape[-1] == 8
+        if action_chunk.dtype != np.float32:
+            action_chunk = action_chunk.astype(np.float32)
+
         # Concatenate the shoulder and wrist images, copied from dataset.py
         shoulder_and_wrist = tf.concat([shoulder, wrist], axis=1)
         shoulder_and_wrist = tf.ensure_shape(shoulder_and_wrist, [None, 576, 512, 3])
         shoulder_and_wrist = tf.cast(tf.round(tf.image.resize(shoulder_and_wrist, (672, 560), method="bicubic")), tf.uint8)
         
-        return {"image": shoulder_and_wrist, "language_instruction": instruction}
+        return {
+            "image": shoulder_and_wrist,
+            "language_instruction": instruction,
+            "action/joint_velocity_chunk": action_chunk,
+        }
 
 # Roboarena compatible server config
 @dataclasses.dataclass
@@ -321,7 +357,7 @@ class ValueFunctionServerConfig:
     n_external_cameras: int = 1
     needs_stereo_camera: bool = False
     needs_session_id: bool = False
-    action_space: str = "joint_position"
+    action_space: str = "joint_velocity_chunk_8d"
 
 class WebsocketValueFunctionServer:
     """
@@ -329,13 +365,13 @@ class WebsocketValueFunctionServer:
 
     Interface:
       Observation:
-        - shoulder_image: (H, W, 3)
-        - wrist_image: (H, W, 3)
-        - language_instruction: str, the natural language task instruction for the policy
-    
-      Return:
-        - logits: (512,), note that during training, only the first 64 logits are trained
+        - shoulder_image: (B, H, W, 3)
+        - wrist_image: (B, H, W, 3)
+        - language_instruction: list of B str, task instructions
+        - action/joint_velocity_chunk: (B, K, 8) joint velocity (7) + binarized gripper (1), K = action_chunk_size
 
+      Return:
+        - logits: (B, 512); training uses first num_buckets for the value head
     """
     def __init__(
         self,

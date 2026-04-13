@@ -32,7 +32,7 @@ from bageljax.common.typing import Batch, PRNGKey
 from bageljax.data.dataset import Dataset
 from bageljax.utils.timer_utils import Timer
 from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, add_batch_sharding_constraint, enforce_sharding_constraints, initialize_compilation_cache
-from bageljax.model.vocabulary import TokenEmbedder, LogitsHead
+from bageljax.model.vocabulary import TokenEmbedder, LogitsHead, ActionProjector
 from bageljax.model.vision_encoder import VisionEncoder
 from bageljax.model.mixture_of_transformers import MixtureOfTransformers
 from bageljax.model.tokenizer import Qwen2Tokenizer, add_special_tokens
@@ -93,13 +93,18 @@ def main(_):
     dataset_seed = FLAGS.config.seed + jax.process_index()
 
     # Create the training dataset
+    dk = FLAGS.config.dataset_kwargs
     train_data = Dataset(
-        data_paths=FLAGS.config.dataset_kwargs["data_paths"],
+        data_paths=dk["data_paths"],
         seed=dataset_seed,
-        batch_size=FLAGS.config.dataset_kwargs["batch_size"],
-        shuffle_buffer_size=FLAGS.config.dataset_kwargs["shuffle_buffer_size"],
-        num_parallel_calls=FLAGS.config.dataset_kwargs["num_parallel_calls"],
+        batch_size=dk["batch_size"],
+        shuffle_buffer_size=dk["shuffle_buffer_size"],
+        num_parallel_calls=dk["num_parallel_calls"],
         train=True,
+        action_chunk_size=dk["action_chunk_size"],
+        action_joint_velocity_mean=dk.get("action_joint_velocity_mean"),
+        action_joint_velocity_std=dk.get("action_joint_velocity_std"),
+        action_norm_eps=float(dk.get("action_norm_eps", 1e-8)),
     )
     train_data_iter = train_data.iterator()
     print("Data loader initialized")
@@ -175,6 +180,7 @@ def main(_):
     networks = {
         "token_embedder": TokenEmbedder(),
         "vision_encoder": VisionEncoder(),
+        "action_projector": ActionProjector(action_dim=8),
         "mixture_of_transformers": MixtureOfTransformers(),
         "logits_head": LogitsHead(),
     }
@@ -209,6 +215,9 @@ def main(_):
                                     vision_encoder = [
                                         jnp.zeros((B, H, W, 3), dtype=jnp.bfloat16),
                                     ],
+                                    action_projector = [
+                                        jnp.zeros((B, FLAGS.config.dataset_kwargs["action_chunk_size"], 8), dtype=jnp.float32),
+                                    ],
                                     mixture_of_transformers = [
                                         jnp.zeros((B, L, llm_hidden_dim), dtype=jnp.bfloat16),
                                         jnp.zeros((B, L), dtype=jnp.int32),
@@ -226,7 +235,6 @@ def main(_):
             target_params=params,
             rng=create_rng,
         )
-    
         return train_state
 
     rng, key = jax.random.split(rng)
@@ -240,8 +248,14 @@ def main(_):
     # Create checkpointer object (used for all subsequent checkpoint loading)
     checkpointer = ocp.Checkpointer(ocp.StandardCheckpointHandler())
 
-    # Load from pre-trained Bagel checkpoint
-    restored_params = checkpointer.restore(FLAGS.config.pretrained_bagel_path, train_state.params)
+    # Load from pre-trained Bagel checkpoint.
+    # Orbax restore requires an exact pytree key match, so we strip the action_projector out first,
+    # restore the remaining weights, then add the fresh action_projector params back.
+    fresh_params = unfreeze(train_state.params)
+    params_for_restore = {k: v for k, v in fresh_params.items() if k != "modules_action_projector"}
+    restored_params = checkpointer.restore(FLAGS.config.pretrained_bagel_path, params_for_restore)
+    restored_params = unfreeze(restored_params)  # ensure plain dict regardless of orbax version
+    restored_params["modules_action_projector"] = fresh_params["modules_action_projector"]
     train_state = train_state.replace(params=restored_params)
 
     # Update target params
@@ -306,6 +320,15 @@ def main(_):
             pre_llm_vit_tokens = jnp.concatenate([image_special_token_embeds[:, 0:1], pre_llm_vit_tokens, image_special_token_embeds[:, 1:2]], axis=1)
             pre_llm_vit_tokens = add_batch_sharding_constraint(pre_llm_vit_tokens, where="pre_llm_vit_tokens")
 
+            # Project action chunk to token embeddings
+            action_tokens = train_state.apply_fn(
+                {"params": params},
+                action=batch["action/joint_velocity_chunk"],
+                name="action_projector",
+            )  # (B, T_action, hidden_dim)
+            print_green(f"action_tokens shape: {action_tokens.shape}")
+            action_tokens = add_batch_sharding_constraint(action_tokens, where="action_tokens")
+
             # embed the text tokens
             text_embeds = train_state.apply_fn(
                 {"params": params},
@@ -314,30 +337,46 @@ def main(_):
             )
             text_embeds = add_batch_sharding_constraint(text_embeds, where="text_embeds")
 
-            # Concat everything along sequence dimension
-            full_seq = jnp.concatenate([pre_llm_vit_tokens, text_embeds], axis=1)
+            # Concat everything along sequence dimension: 
+            # [img_tokens | action_token | text_tokens]
+            full_seq = jnp.concatenate([pre_llm_vit_tokens, action_tokens, text_embeds], axis=1)
             full_seq = add_batch_sharding_constraint(full_seq, where="full_seq")
 
             # Prepare full seq rope IDs
-            image_rope_ids = jnp.zeros((pre_llm_vit_tokens.shape[1],), dtype=jnp.int32)[None, :]
+            # Image tokens and action token both get rope_id=0 (no positional bias)
+            N_img = pre_llm_vit_tokens.shape[1]
+            N_action = action_tokens.shape[1]
+            image_rope_ids = jnp.zeros((N_img,), dtype=jnp.int32)[None, :]
             image_rope_ids = jnp.tile(image_rope_ids, (full_seq.shape[0], 1))
 
-            full_seq_rope_ids = jnp.concatenate([image_rope_ids, batch["text_rope_ids"]], axis=1)
+            action_rope_ids = (jnp.arange(N_action, dtype=jnp.int32) + 1)[None, :]
+            action_rope_ids = jnp.tile(action_rope_ids, (full_seq.shape[0], 1))
+            text_rope_ids = jnp.where(
+                batch["text_token_masks"],
+                batch["text_rope_ids"] + N_action,
+                0,
+            )
+            full_seq_rope_ids = jnp.concatenate([image_rope_ids, action_rope_ids, text_rope_ids], axis=1)
             full_seq_rope_ids = add_batch_sharding_constraint(full_seq_rope_ids, where="full_seq_rope_ids")
 
             # Now prepare attention masks
             L = full_seq.shape[1]
             # Start with a causal mask
             causal = jnp.tril(jnp.ones((L, L), dtype=bool))
-            # Enable full self-attention for vit tokens
-            arr = jnp.concatenate([jnp.ones((pre_llm_vit_tokens.shape[1],), dtype=bool), jnp.zeros((L - pre_llm_vit_tokens.shape[1]), dtype=bool)])
+            # Enable full self-attention for vit tokens only (not action/text tokens).
+            arr = jnp.concatenate([jnp.ones((N_img,), dtype=bool), jnp.zeros((L - N_img,), dtype=bool)])
             self_attention_mask = jnp.matmul(arr[:, None], arr[None, :])
             block_causal = causal | self_attention_mask
             # Now tile to include batch dimension
             block_causal = jnp.tile(block_causal[None, ...], (full_seq.shape[0], 1, 1))
             block_causal = add_batch_sharding_constraint(block_causal, where="block_causal")
             # padding sees nothing, and is seen by nothing
-            padding = jnp.concatenate([jnp.zeros((full_seq.shape[0], pre_llm_vit_tokens.shape[1]), dtype=bool), jnp.logical_not(batch["text_token_masks"])], axis=1)
+            # image and action tokens are never padding; only text tokens can be padded.
+            padding = jnp.concatenate([
+                jnp.zeros((full_seq.shape[0], N_img), dtype=bool),
+                jnp.zeros((full_seq.shape[0], N_action), dtype=bool),
+                jnp.logical_not(batch["text_token_masks"]),
+            ], axis=1)
             padding = add_batch_sharding_constraint(padding, where="padding")
             allowed_attention = jnp.where(padding[:, :, None] | padding[:, None, :], False, block_causal)
             attn_bias = jnp.where(allowed_attention, 0.0, -1e30)[:, None, :, :]   # (B,1,L,L)
@@ -371,7 +410,7 @@ def main(_):
             value_logits = value_logits[:, 0]
 
             # Construct cross-entropy targets
-            discounted_distances = jnp.power(config["discount_factor"], batch["distance"]-1) # we subtract 1 bc we know that min(batch["distance"])==1
+            discounted_distances = jnp.power(config["discount_factor"], batch["distance"]) 
             # this will have shape (B,), dtype float32, and contain values from 0 to 1
             assert discounted_distances.shape == (post_llm_seq.shape[0],)
             assert discounted_distances.dtype == jnp.float32
@@ -424,8 +463,7 @@ def main(_):
         # Returns immediately; writes happen in the background.
         checkpointer.save(step_dir, args=ocp.args.StandardSave(train_state, save_args=save_args))
 
-    # Synchronize all workers before entering the training loop.
-    # This ensures no worker is ahead of others due to variable initialization time.
+    # Synchronize all workers before entering the training loop. Ensures no worker is ahead of others due to variable initialization time.
     multihost_utils.sync_global_devices("pre_train_loop")
 
     # Train loop

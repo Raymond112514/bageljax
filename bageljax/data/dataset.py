@@ -1,9 +1,78 @@
 import fnmatch
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, List, Optional, Sequence, Union
 
 import numpy as np
 import tensorflow as tf
 from absl import logging
+
+from bageljax.data.action_statistics import normalize_joint_velocity_7d
+
+@tf.function
+def binarize_gripper_action(x):
+    """Full-trajectory gripper channel [T] -> binarized {-1, +1}
+    Copied from value function policy training code.
+    Safe for T==0 (e.g. stop-action mask removed every timestep)."""
+    x = tf.reshape(x, [-1])
+    n = tf.shape(x)[0]
+
+    def nonempty():
+        # Reverse the tensor to process it from the end to the start
+        x_reversed = tf.reverse(x, axis=[0])
+
+        # Compute the starts where the current element is zero and the next is non-zero
+        x_reversed_padded = tf.concat([x_reversed[0:1], x_reversed[:-1]], axis=0)
+        starts = tf.cast(
+            (x_reversed_padded == 0.0) & (x_reversed != 0.0),
+            tf.float32,
+        )
+
+        idx = tf.constant(0)
+        in_sequence = tf.constant(0.0)
+        prev_x = x_reversed[0]
+        mask_ta = tf.TensorArray(dtype=tf.float32, size=n)
+
+        def cond(idx, in_sequence, prev_x, mask_ta):
+            return idx < n
+
+        def body(idx, in_sequence, prev_x, mask_ta):
+            start_flag = starts[idx]
+            x_curr = x_reversed[idx]
+
+            in_sequence = tf.where(start_flag > 0, 1.0, in_sequence)
+
+            in_sequence = tf.where(
+                (in_sequence > 0) & (prev_x >= x_curr),
+                0.0,
+                in_sequence,
+            )
+
+            mask_value = tf.where(in_sequence > 0, 0.0, 1.0)
+
+            mask_ta = mask_ta.write(idx, mask_value)
+
+            idx += 1
+            prev_x = x_curr
+
+            return idx, in_sequence, prev_x, mask_ta
+
+        idx, in_sequence, prev_x, mask_ta = tf.while_loop(
+            cond, body, loop_vars=[idx, in_sequence, prev_x, mask_ta]
+        )
+
+        mask = mask_ta.stack()
+        x_zeroed = x_reversed * mask
+
+        result = tf.reverse(x_zeroed, axis=[0])
+
+        result = tf.where(result > 0, 1.0, -1.0)
+
+        return result
+
+    return tf.cond(
+        tf.equal(n, 0),
+        lambda: tf.zeros([0], dtype=tf.float32),
+        nonempty,
+    )
 
 class Dataset:
     IMG_KEYS = (
@@ -12,7 +81,9 @@ class Dataset:
         "shoulder_image_2",
     )
     F32_KEYS = (
+        "action/joint_velocity",
         "action/cartesian_velocity",
+        "action/gripper_position",  # [T] or [T, 1]; binarized and concat -> 8D with joint_velocity
     )
     STR_KEYS = (
         "language_instruction1",
@@ -29,6 +100,10 @@ class Dataset:
         shuffle_buffer_size: int = 10000,
         train: bool = True,
         num_parallel_calls: int = 10,
+        action_chunk_size: int = 30,
+        action_joint_velocity_mean: Optional[Sequence[float]] = None,
+        action_joint_velocity_std: Optional[Sequence[float]] = None,
+        action_norm_eps: float = 1e-8,
         **kwargs,
     ):
         logging.warning("Extra kwargs passed to Dataset: %s", kwargs)
@@ -49,6 +124,25 @@ class Dataset:
         self.shuffle_buffer_size = int(shuffle_buffer_size)
         self.batch_size = int(batch_size)
         self.seed = int(seed)
+        self.action_chunk_size = int(action_chunk_size)
+
+        if action_joint_velocity_mean is not None and action_joint_velocity_std is not None:
+            mean = np.asarray(action_joint_velocity_mean, dtype=np.float32)
+            std = np.asarray(action_joint_velocity_std, dtype=np.float32)
+            if mean.shape != (7,) or std.shape != (7,):
+                raise ValueError(
+                    "action_joint_velocity_mean/std must have shape (7,), got "
+                    f"{mean.shape}, {std.shape}",
+                )
+            self._jv_mean = tf.constant(mean)
+            self._jv_std = tf.constant(std)
+            self._jv_eps = tf.constant(float(action_norm_eps), tf.float32)
+            self._normalize_joint_velocity = True
+        else:
+            self._normalize_joint_velocity = False
+            self._jv_mean = None
+            self._jv_std = None
+            self._jv_eps = None
 
         # Seed domains: keep different RNG uses separated for clarity.
         self._path_shuffle_base_seed = self.seed + 101
@@ -162,8 +256,13 @@ class Dataset:
             num_parallel_calls=self.num_parallel_calls,
         )
         ds = ds.filter(self._filter_by_len)
+        ds = ds.filter(self._filter_by_action_chunk_len)
         ds = ds.map(
             self._add_distances,
+            num_parallel_calls=self.num_parallel_calls,
+        )
+        ds = ds.map(
+            self._add_action_chunks,
             num_parallel_calls=self.num_parallel_calls,
         )
 
@@ -241,7 +340,10 @@ class Dataset:
         # Parse serialized float tensors (required); dtype is float32.
         for k in self.F32_KEYS:
             out[k] = tf.io.parse_tensor(parsed[k], out_type=tf.float32)
-            out[k] = tf.ensure_shape(out[k], [None, None])
+            if k == "action/gripper_position":
+                out[k] = tf.reshape(out[k], [-1])  # [T]
+            else:
+                out[k] = tf.ensure_shape(out[k], [None, None])
 
         # Strings (required)
         for k in self.STR_KEYS:
@@ -270,8 +372,19 @@ class Dataset:
         for k in self.F32_KEYS:
             out[k] = tf.boolean_mask(out[k], mask, axis=0)
 
-        # Drop now-unused key
+        # Only joint velocity is needed downstream; cartesian was for masking only.
         del out["action/cartesian_velocity"]
+
+        # Full-trajectory gripper binarization, then 7D velocity + 1D gripper -> 8D action.
+        grip_bin = binarize_gripper_action(out["action/gripper_position"])
+        del out["action/gripper_position"]
+        jv = out["action/joint_velocity"]  # [T, 7]
+        if self._normalize_joint_velocity:
+            jv = normalize_joint_velocity_7d(jv, self._jv_mean, self._jv_std, self._jv_eps)
+        out["action/joint_velocity"] = tf.concat(
+            [jv, grip_bin[:, tf.newaxis]],
+            axis=-1,
+        )  # [T, 8]
 
         T = tf.shape(out[self.IMG_KEYS[0]])[0]  # time length after mask
         # Repeat language strings to enable unbatching later
@@ -285,10 +398,35 @@ class Dataset:
         traj_len = tf.shape(traj["wrist_image"])[0]
         # Return a boolean indicating whether to keep this example
         return traj_len >= 20
+
+    def _filter_by_action_chunk_len(self, traj):
+        traj_len = tf.shape(traj["wrist_image"])[0]
+        return traj_len >= self.action_chunk_size
     
     def _add_distances(self, traj):
         T = tf.shape(traj["wrist_image"])[0]
         traj["distance"] = T - tf.range(T, dtype=tf.int32)
+        return traj
+
+    def _add_action_chunks(self, traj):
+        """Build fixed-length future action chunks and drop invalid tail states."""
+        actions = traj["action/joint_velocity"]  # [T, D]
+        T = tf.shape(actions)[0]
+        K = self.action_chunk_size
+
+        # idx[t, j] = t + j for chunk position j at timestep t.
+        valid_T = T - K + 1
+        base = tf.range(valid_T, dtype=tf.int32)[:, None]
+        offsets = tf.range(K, dtype=tf.int32)[None, :]
+        idx = base + offsets  # [valid_T, K]
+
+        action_chunks = tf.gather(actions, idx, axis=0)  # [valid_T, K, 8]
+
+        # Keep only states that have a full K-step future chunk
+        for k in list(traj.keys()):
+            traj[k] = traj[k][:valid_T]
+
+        traj["action/joint_velocity_chunk"] = tf.ensure_shape(action_chunks, [None, K, 8])
         return traj
 
     # --------------------------------------------------------------------- #

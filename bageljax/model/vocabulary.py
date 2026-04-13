@@ -5,6 +5,29 @@ import flax.linen as nn
 
 from bageljax.utils.jax_utils import add_batch_sharding_constraint
 
+
+class ActionProjector(nn.Module):
+    """Projects continuous action vectors into one or more LLM token embeddings."""
+    action_dim: int = 8  # 7D joint velocity + 1D binarized gripper
+    hidden_dim: int = 3_584
+    init_std: float = 0.02
+    param_dtype: jnp.dtype = jnp.bfloat16
+
+    @nn.compact
+    def __call__(self, action: jnp.ndarray) -> jnp.ndarray:
+        # action: (B, action_dim) or (B, T, action_dim), float32
+        action = add_batch_sharding_constraint(action, where="input to action projector")
+        if action.ndim == 2:
+            action = action[:, None, :]
+        x = action.astype(jnp.bfloat16)
+        x = nn.Dense(
+            self.hidden_dim,
+            kernel_init=nn.initializers.normal(self.init_std),
+            param_dtype=self.param_dtype,
+        )(x)                              # (B, T, hidden_dim)
+        x = nn.LayerNorm(param_dtype=self.param_dtype)(x)
+        return x
+
 class TokenEmbedder(nn.Module):
     vocab_size: int = 152_064
     hidden_dim: int = 3_584

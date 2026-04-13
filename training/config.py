@@ -2,6 +2,12 @@ import os
 from ml_collections import ConfigDict
 import numpy as np
 
+from bageljax.data.action_statistics import (
+    ACTION_JOINT_VELOCITY_MEAN,
+    ACTION_JOINT_VELOCITY_STD,
+    ACTION_NORM_EPS,
+)
+
 def get_config(config_string):
     base_config = dict(
         num_steps=int(1000000),
@@ -19,7 +25,12 @@ def get_config(config_string):
         batch_size=12,
         shuffle_buffer_size=100000,
         num_parallel_calls=10,
-        max_prompt_length=254, # accounts for num tokens in longest prompt, the rewriting of the instruction, and the pad tokens needed to make global seq len a multiple of 128
+        action_chunk_size=30,
+        max_prompt_length=224, # accounts for num tokens in longest prompt, the rewriting of the instruction, and the pad tokens needed to make global seq len a multiple of 128
+        # Normalization for first 7 dims of 8D action (joint velocity); gripper stays ±1.
+        action_joint_velocity_mean=list(ACTION_JOINT_VELOCITY_MEAN),
+        action_joint_velocity_std=list(ACTION_JOINT_VELOCITY_STD),
+        action_norm_eps=ACTION_NORM_EPS,
     )
 
     possible_structures = {

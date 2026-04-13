@@ -8,6 +8,7 @@ from media_saver import MediaSaver
 import imageio
 
 NUM_BUCKETS = 64
+ACTION_CHUNK_SIZE = 30  # must match training / inference_server INFERENCE_CONFIG
 
 INFERENCE_DATA_PATHS = [
     "gs://raymond-us-west1/droid/roboarena/roboarena-00000.tfrecord",
@@ -78,24 +79,38 @@ async def main():
         file_index = traj.as_dict()['tfrecord_shard_id']
         print_green(f"File index: {file_index}")
         media_saver = MediaSaver(save_dir=f"media/{file_index}_{language_instruction}")
-        ep_len = traj.as_dict()['wrist_image'].shape[0]
+        d = traj.as_dict()
+        ep_len = d["wrist_image"].shape[0]
+        full_action_8d = d["action/joint_velocity"]  # (T, 8)
         print(f"Episode length: {ep_len}")
         all_values = []
         num_devices = 4
-        max_bound = (ep_len // num_devices) * num_devices
+        K = ACTION_CHUNK_SIZE
+        # Need t + num_devices - 1 + K <= ep_len  =>  t <= ep_len - K - num_devices + 1
+        max_t = ep_len - K - num_devices + 1
+        if max_t < 0:
+            print(f"Skip episode: ep_len {ep_len} too short for K={K} and batch {num_devices}")
+            continue
         all_logits = []
-        for t in range(0, max_bound, num_devices):
+        for t in range(0, max_t + 1, num_devices):
             print(f"Processing time step {t}")
-            wrist_image = traj.as_dict()['wrist_image'][t:t+num_devices]
-            shoulder_image = traj.as_dict()['shoulder_image'][t:t+num_devices]
+            wrist_image = d["wrist_image"][t : t + num_devices]
+            shoulder_image = d["shoulder_image"][t : t + num_devices]
+            action_chunks = np.stack(
+                [full_action_8d[t + i : t + i + K] for i in range(num_devices)],
+                axis=0,
+            )
+            print(f"action/joint_velocity_chunk shape: {action_chunks.shape}")
+            print(f"shoulder image shape: {shoulder_image.shape}")
+            print(f"wrist image shape: {wrist_image.shape}")
             instruction = [
-                x for x in traj.as_dict()['language_instruction'][t : t + num_devices]
+                x for x in d["language_instruction"][t : t + num_devices]
             ]
-            image = np.concatenate([wrist_image, shoulder_image], axis=1)
             obs = {
                 "shoulder_image": shoulder_image,
                 "wrist_image": wrist_image,
                 "language_instruction": instruction,
+                "action/joint_velocity_chunk": action_chunks.astype(np.float32),
             }
             async with websockets.connect(uri, max_size=None, compression=None) as ws:
                 cfg = msgpack_numpy.unpackb(await ws.recv())
