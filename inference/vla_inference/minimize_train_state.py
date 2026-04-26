@@ -42,8 +42,8 @@ def get_checkpoint_suffix(path: str) -> str:
 # --------------- all configs/hyperparams for inference are stored here, modify at will ---------------
 INFERENCE_CONFIG = {
     "seed": 0,
-    "checkpoint_load_dir": "gs://raymond-us-west1/value_function_logs/value_function/value_function_20260408_172143/00020000",
-    "reduced_checkpoint_save_dir": "gs://raymond-us-west1/value_function_bagel_action_cond_checkpoints",
+    "checkpoint_load_dir": "gs://raymond-us-west1/value_function_logs/roboarena_dropout0.2/00040000",
+    "reduced_checkpoint_save_dir": "gs://raymond-us-west1",
 }
 INFERENCE_CONFIG["reduced_checkpoint_save_dir"] = (
     f"{INFERENCE_CONFIG['reduced_checkpoint_save_dir']}/"

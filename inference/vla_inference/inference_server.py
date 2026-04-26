@@ -28,10 +28,10 @@ from bageljax.utils import msgpack_numpy
 
 INFERENCE_CONFIG = {
     "seed": 0,
-    "checkpoint_load_dir": "gs://raymond-us-west1/value_function_bagel_action_cond_checkpoints/value_function_20260408_172143/00020000",
+    "checkpoint_load_dir": "gs://raymond-us-west1/minimized_train_state/roboarena_dropout0.0/00020000",
     "tokenizer_load_path": "/nfs/nfs5/users/raymond/bagel_tokenizer",
     "max_prompt_length": 224,
-    "action_chunk_size": 30,  # must match training; seq len = N_img + K + max_prompt_length
+    "action_chunk_size": 30,  
 }
 
 # Create the language tokenizer
@@ -318,33 +318,27 @@ class ValueFunction:
         return {"logits": logits}
     
     def preprocess_obs(self, obs: Dict) -> Dict:
-        # The image shape should be (B, 288, 512, 3), and the instruction shape
-        # should be a list with length B.
         shoulder = obs["shoulder_image"]
         assert type(shoulder) == np.ndarray
         assert shoulder.shape[1:] == (288, 512, 3)
         assert shoulder.dtype == np.uint8
         
-        wrist = obs["wrist_image"]
-        assert type(wrist) == np.ndarray
-        assert wrist.shape[1:] == (288, 512, 3)
-        assert wrist.dtype == np.uint8
-        
         instruction = obs["language_instruction"]
-        # (B, K, 8): 7D joint velocity + binarized gripper per timestep, same as training.
         action_chunk = obs["action/joint_velocity_chunk"]
         assert type(action_chunk) == np.ndarray
         assert action_chunk.ndim == 3 and action_chunk.shape[-1] == 8
         if action_chunk.dtype != np.float32:
             action_chunk = action_chunk.astype(np.float32)
 
-        # Concatenate the shoulder and wrist images, copied from dataset.py
-        shoulder_and_wrist = tf.concat([shoulder, wrist], axis=1)
-        shoulder_and_wrist = tf.ensure_shape(shoulder_and_wrist, [None, 576, 512, 3])
-        shoulder_and_wrist = tf.cast(tf.round(tf.image.resize(shoulder_and_wrist, (672, 560), method="bicubic")), tf.uint8)
+        shoulder_t = tf.convert_to_tensor(shoulder)
+        shoulder_t = tf.ensure_shape(shoulder_t, [None, 288, 512, 3])
+        image = tf.cast(
+            tf.round(tf.image.resize(shoulder_t, (672, 560), method="bicubic")),
+            tf.uint8,
+        )
         
         return {
-            "image": shoulder_and_wrist,
+            "image": image,
             "language_instruction": instruction,
             "action/joint_velocity_chunk": action_chunk,
         }
@@ -353,7 +347,7 @@ class ValueFunction:
 @dataclasses.dataclass
 class ValueFunctionServerConfig:
     image_resolution: tuple[int, int] | None = (672, 560)
-    needs_wrist_camera: bool = True
+    needs_wrist_camera: bool = False
     n_external_cameras: int = 1
     needs_stereo_camera: bool = False
     needs_session_id: bool = False
@@ -365,8 +359,8 @@ class WebsocketValueFunctionServer:
 
     Interface:
       Observation:
-        - shoulder_image: (B, H, W, 3)
-        - wrist_image: (B, H, W, 3)
+        - shoulder_image: (B, 288, 512, 3) uint8 — resized to (672, 560) like training
+        - wrist_image: optional (B, 288, 512, 3) uint8 — ignored for the model; kept for client compatibility
         - language_instruction: list of B str, task instructions
         - action/joint_velocity_chunk: (B, K, 8) joint velocity (7) + binarized gripper (1), K = action_chunk_size
 
@@ -425,7 +419,7 @@ rng, value_function_rng = jax.random.split(rng)
 value_function = ValueFunction(rng=value_function_rng)
 server_config = ValueFunctionServerConfig(
     image_resolution=(672, 560),
-    needs_wrist_camera=True,
+    needs_wrist_camera=False,
     n_external_cameras=1,
 )
 server = WebsocketValueFunctionServer(value_function, server_config)

@@ -6,12 +6,12 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import tensorflow as tf
 
-from bageljax.data.action_statistics import (
+from bageljax.data.data_utils import (
     ACTION_NORM_EPS,
+    binarize_gripper_action,
     default_joint_velocity_norm_tensors,
     normalize_joint_velocity_7d,
 )
-from bageljax.data.dataset import binarize_gripper_action
 
 _TFRECORD_SHARD_RE = re.compile(r"-(\d+)\.tfrecord(?:\..*)?$")
 
@@ -22,20 +22,19 @@ class TrajectoryObservation:
       - wrist_image: (T, 288, 512, 3)
       - shoulder_image: (T, 288, 512, 3)
       - language_instruction: (T,)
-      - action/cartesian_velocity: (T, 6)
       - action/joint_velocity: (T, 8) — 7D joint velocity + binarized gripper (matches training)
-      - image: (T, 672, 560, 3), the concatenated shoulder and wrist images
+      - image: (T, 672, 560, 3), shoulder-only after resize (matches training Dataset)
       - distance: (T,)
     """
     wrist_image: np.ndarray
     shoulder_image: np.ndarray
     language_instruction: np.ndarray
-    action_cartesian_velocity: np.ndarray
     action_joint_8d: np.ndarray
     image: np.ndarray
     distance: np.ndarray
     tfrecord_path: str
     tfrecord_file_index: int
+    tfrecord_example_index: int
     tfrecord_shard_id: Optional[int]
 
     def as_dict(self) -> Dict[str, Any]:
@@ -43,12 +42,12 @@ class TrajectoryObservation:
             "wrist_image": self.wrist_image,
             "shoulder_image": self.shoulder_image,
             "language_instruction": self.language_instruction,
-            "action/cartesian_velocity": self.action_cartesian_velocity,
             "action/joint_velocity": self.action_joint_8d,
             "image": self.image,
             "distance": self.distance,
             "tfrecord_path": self.tfrecord_path,
             "tfrecord_file_index": self.tfrecord_file_index,
+            "tfrecord_example_index": self.tfrecord_example_index,
             "tfrecord_shard_id": self.tfrecord_shard_id,
         }
 
@@ -66,7 +65,6 @@ class TrajectoryDataSampler:
         "language_instruction3",
     )
     F32_KEYS = (
-        "action/cartesian_velocity",
         "action/joint_velocity",
         "action/gripper_position",
     )
@@ -92,6 +90,8 @@ class TrajectoryDataSampler:
             raise ValueError(f"Unsupported shoulder_stream={shoulder_stream}")
         if language_stream not in self.STR_KEYS:
             raise ValueError(f"Unsupported language_stream={language_stream}")
+        self._jv_mean, self._jv_std = default_joint_velocity_norm_tensors()
+        self._jv_eps = tf.constant(ACTION_NORM_EPS, dtype=tf.float32)
         self._rng = random.Random(int(seed))
         self._shoulder_stream = shoulder_stream
         self._language_stream = language_stream
@@ -124,7 +124,7 @@ class TrajectoryDataSampler:
         Args:
           - tfrecord_file_index: if None, choose a random TFRecord file.
           - example_index: index of the example within the selected TFRecord file.
-          - min_traj_len: minimum post-mask trajectory length.
+          - min_traj_len: minimum trajectory length.
           - max_attempts: how many consecutive examples to try before giving up.
         """
         if tfrecord_file_index is None:
@@ -145,22 +145,21 @@ class TrajectoryDataSampler:
             except StopIteration:
                 break
 
-            traj, cartesian_tf = self._decode_trajectory(serialized_example)
+            traj = self._decode_trajectory(serialized_example)
 
             wrist_T = int(tf.shape(traj["wrist_image"])[0].numpy())
             last_wrist_len = wrist_T
             if wrist_T >= int(min_traj_len):
-                # traj tensors are already time-masked; choose shoulder/language.
                 shoulder = traj[self._shoulder_stream]
                 wrist = traj["wrist_image"]
                 instruction = traj[self._language_stream]  # [T] bytes
 
-                # Stack shoulder then wrist along height, producing [T, 576, 512, 3].
-                shoulder_and_wrist = tf.concat([shoulder, wrist], axis=1)
-                shoulder_and_wrist = tf.cast(
+                # Shoulder only
+                shoulder = tf.ensure_shape(shoulder, [None, 288, 512, 3])
+                image = tf.cast(
                     tf.round(
                         tf.image.resize(
-                            shoulder_and_wrist,
+                            shoulder,
                             self._image_resolution,
                             method="bicubic",
                         )
@@ -176,12 +175,12 @@ class TrajectoryDataSampler:
                     wrist_image=wrist.numpy(),
                     shoulder_image=shoulder.numpy(),
                     language_instruction=instruction.numpy(),
-                    action_cartesian_velocity=cartesian_tf.numpy(),
                     action_joint_8d=traj["action/joint_velocity"].numpy(),
-                    image=shoulder_and_wrist.numpy(),
+                    image=image.numpy(),
                     distance=distance.numpy(),
                     tfrecord_path=str(tfrecord_path),
                     tfrecord_file_index=tfrecord_file_index,
+                    tfrecord_example_index=current_example_index,
                     tfrecord_shard_id=tfrecord_shard_id,
                 )
 
@@ -208,16 +207,13 @@ class TrajectoryDataSampler:
         )
         return tf.ensure_shape(frames, [None, 288, 512, 3])
 
-    def _decode_trajectory(
-        self, serialized_example: tf.Tensor
-    ) -> tuple[Dict[str, tf.Tensor], tf.Tensor]:
+    def _decode_trajectory(self, serialized_example: tf.Tensor) -> Dict[str, tf.Tensor]:
         """Decode a single TFRecord example into image, language, and action sequences.
 
-        This decode mirrors the training dataset preprocessing closely enough for
-        inference-time replay from recorded trajectories.
+        Does not read `action/cartesian_velocity` (ignored for inference replay).
 
         Returns:
-          traj dict (includes action/joint_velocity as [T, 8]) and cartesian velocity [T, 6] before removal.
+          traj dict with `action/joint_velocity` as [T, 8] after normalization + gripper.
         """
         feature_spec = {
             **{k: tf.io.VarLenFeature(tf.string) for k in self.IMG_KEYS},
@@ -233,7 +229,7 @@ class TrajectoryDataSampler:
         for k in self.IMG_KEYS:
             out[k] = self._decode_jpeg_sequence(parsed[k])  # [T, 288, 512, 3]
 
-        # Parse serialized float tensors.
+        # Parse serialized float tensors (joint + gripper).
         for k in self.F32_KEYS:
             out[k] = tf.io.parse_tensor(parsed[k], out_type=tf.float32)
             if k == "action/gripper_position":
@@ -255,30 +251,12 @@ class TrajectoryDataSampler:
             ]):
                 out[k] = tf.identity(out[k])
 
-        # Apply the same stop-action mask as training so action-conditioned
-        # inference replays the same filtered timesteps.
-        a_cartesian_velocity = out["action/cartesian_velocity"]
-        vec3 = a_cartesian_velocity[..., :3]
-        xyz_action_se = tf.reduce_sum(tf.square(vec3), axis=-1)
-        mask = xyz_action_se > 1e-3
-
-        for k in self.IMG_KEYS:
-            out[k] = tf.boolean_mask(out[k], mask, axis=0)
-        for k in self.F32_KEYS:
-            out[k] = tf.boolean_mask(out[k], mask, axis=0)
-
-        cartesian_for_return = out["action/cartesian_velocity"]
-        del out["action/cartesian_velocity"]
+        # Same order as bageljax.data.dataset.Dataset._decode_example: gripper
+        # binarization, then (jv - mean) / (std + eps) on the first 7 dims, then concat.
         grip_bin = binarize_gripper_action(out["action/gripper_position"])
         del out["action/gripper_position"]
         jv = out["action/joint_velocity"]
-        jv_mean, jv_std = default_joint_velocity_norm_tensors()
-        jv = normalize_joint_velocity_7d(
-            jv,
-            jv_mean,
-            jv_std,
-            tf.constant(ACTION_NORM_EPS, dtype=tf.float32),
-        )
+        jv = normalize_joint_velocity_7d(jv, self._jv_mean, self._jv_std, self._jv_eps)
         out["action/joint_velocity"] = tf.concat([jv, grip_bin[:, tf.newaxis]], axis=-1)
 
         # Repeat language strings to shape [T].
@@ -286,4 +264,4 @@ class TrajectoryDataSampler:
         for k in self.STR_KEYS:
             out[k] = tf.fill([T], out[k])
 
-        return out, cartesian_for_return
+        return out

@@ -2,7 +2,7 @@ import os
 from ml_collections import ConfigDict
 import numpy as np
 
-from bageljax.data.action_statistics import (
+from bageljax.data.data_utils import (
     ACTION_JOINT_VELOCITY_MEAN,
     ACTION_JOINT_VELOCITY_STD,
     ACTION_NORM_EPS,
@@ -18,6 +18,8 @@ def get_config(config_string):
         pretrained_bagel_path="gs://raymond-us-west1/value_function_starting_components/bagel",
         tokenizer_load_path="/nfs/nfs5/users/raymond/bagel_tokenizer",
         seed=137,
+        # If True, each step mixes half-batch DROID + half-batch RoboArena
+        use_roboarena=True,
     )
 
     base_data_config = dict(
@@ -33,6 +35,18 @@ def get_config(config_string):
         action_norm_eps=ACTION_NORM_EPS,
     )
 
+    _ROBOARENA_PREFIX = "gs://raymond-us-west1/droid_labeled/roboarena_renamed"
+    _ROBOARENA_SHARD_BASENAME = "roboarena"
+    _roboarena_shard_paths = [
+        f"{_ROBOARENA_PREFIX}/{_ROBOARENA_SHARD_BASENAME}-{i:05d}.tfrecord"
+        for i in range(40)
+    ]
+
+    roboarena_data_config = {
+        **base_data_config,
+        "data_paths": [_roboarena_shard_paths],
+    }
+
     possible_structures = {
         "bagel_value_function": ConfigDict(
             dict(
@@ -46,9 +60,13 @@ def get_config(config_string):
                     decay_steps=None,
                     warmup_steps=2500,
                     target_update_rate=0.9999,
+                    obs_dropout_prob=0.5, # Randomly drop out the image tokens with probability p
                 ),
                 dataset_kwargs=dict(
                     **base_data_config,
+                ),
+                roboarena_dataset_kwargs=dict(
+                    **roboarena_data_config,
                 ),
                 **base_config,
             )

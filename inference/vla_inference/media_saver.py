@@ -17,11 +17,24 @@ class MediaSaver:
         img = np.clip(img, 0, 1)
         return (img * 255).astype(np.uint8)
 
-    def _render_plot(self, values_so_far, total_len, height, width=500, ymin=None, ymax=None, title="Value over time"):
+    def _render_plot(
+        self,
+        values_so_far,
+        ground_truth_so_far,
+        total_len,
+        height,
+        width=500,
+        ymin=None,
+        ymax=None,
+        title="Value over time",
+        stride=1,
+    ):
         fig, ax = plt.subplots(figsize=(width / 100, height / 100), dpi=100)
 
-        x = np.arange(len(values_so_far))
-        ax.plot(x, values_so_far, linewidth=2)
+        x = np.arange(len(values_so_far)) * int(stride)
+        ax.plot(x, values_so_far, linewidth=2, label="predicted")
+        if ground_truth_so_far is not None and len(ground_truth_so_far) > 0:
+            ax.plot(x, ground_truth_so_far, linewidth=2, linestyle="--", label="ground_truth")
         ax.set_xlim(0, max(total_len - 1, 1))
         ax.set_ylim(ymin, ymax)
 
@@ -29,6 +42,8 @@ class MediaSaver:
         ax.set_ylabel("Value")
         ax.set_title(title)
         ax.grid(True, alpha=0.3)
+        if ground_truth_so_far is not None and len(ground_truth_so_far) > 0:
+            ax.legend(loc="upper right")
 
         fig.tight_layout()
 
@@ -49,13 +64,24 @@ class MediaSaver:
         fps=10,
         plot_width=500,
         title="Value over time",
+        stride=1,
+        ground_truth_values=None,
     ):
         ep_len = min(len(images), len(values))
+        gt = None
+        if ground_truth_values is not None:
+            gt = np.asarray(ground_truth_values, dtype=np.float32)
+            ep_len = min(ep_len, len(gt))
         images = images[:ep_len]
         values = np.asarray(values[:ep_len], dtype=np.float32)
+        if gt is not None:
+            gt = gt[:ep_len]
         
         global_min = np.min(values)
         global_max = np.max(values)
+        if gt is not None and len(gt) > 0:
+            global_min = min(global_min, float(np.min(gt)))
+            global_max = max(global_max, float(np.max(gt)))
 
         if np.isclose(global_min, global_max):
             pad = 1.0
@@ -83,12 +109,14 @@ class MediaSaver:
 
                 plot_img = self._render_plot(
                     values_so_far=values[: t + 1],
-                    total_len=ep_len,
+                    ground_truth_so_far=None if gt is None else gt[: t + 1],
+                    total_len=ep_len * int(stride),
                     height=H,
                     width=plot_width,
                     ymin=ymin,
                     ymax=ymax,
                     title=title,
+                    stride=stride,
                 )
 
                 combined = np.concatenate([img, plot_img], axis=1)

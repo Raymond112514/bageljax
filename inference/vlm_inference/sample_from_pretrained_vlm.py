@@ -237,6 +237,6 @@ def vqa(prompt: str, image: Image):
 ############################# VQA #############################
 ###############################################################
 source_image = Image.open("samples/meme.jpg")
-prompt = "Can someone explain what’s funny about this meme??"
+prompt = "Can someone explain what's funny about this meme??"
 model_response = vqa(prompt, source_image)
 print(model_response)

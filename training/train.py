@@ -30,6 +30,7 @@ from bageljax.common.common import TrainState, ModuleDict, nonpytree_field
 from bageljax.common.optimizers import make_optimizer
 from bageljax.common.typing import Batch, PRNGKey
 from bageljax.data.dataset import Dataset
+from bageljax.data.roboarena_dataset import Dataset as RoboArenaDataset
 from bageljax.utils.timer_utils import Timer
 from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, add_batch_sharding_constraint, enforce_sharding_constraints, initialize_compilation_cache
 from bageljax.model.vocabulary import TokenEmbedder, LogitsHead, ActionProjector
@@ -92,13 +93,28 @@ def main(_):
     # Use different dataset seeds for each worker
     dataset_seed = FLAGS.config.seed + jax.process_index()
 
-    # Create the training dataset
     dk = FLAGS.config.dataset_kwargs
+    ra_dk = FLAGS.config.roboarena_dataset_kwargs
+    total_batch_size = int(dk["batch_size"])
+    use_roboarena = bool(FLAGS.config.get("use_roboarena", True))
+    half_batch_size = total_batch_size // 2 if use_roboarena else total_batch_size
+
+    # Reduce shuffle buffer size for each pipeline when mixing two sources to avoid OOM
+    _min_shuffle = 2048
+    if use_roboarena:
+        shuffle_droid = max(_min_shuffle, int(dk["shuffle_buffer_size"]) // 2)
+        shuffle_robo = max(_min_shuffle, int(ra_dk["shuffle_buffer_size"]) // 2)
+        print(f"use_roboarena=True: shuffle_droid={shuffle_droid}, shuffle_robo={shuffle_robo}")
+    else:
+        shuffle_droid = max(_min_shuffle, int(dk["shuffle_buffer_size"]))
+        print(f"use_roboarena=False: shuffle_droid={shuffle_droid} (DROID only)")
+
+    # Create the training dataset
     train_data = Dataset(
         data_paths=dk["data_paths"],
         seed=dataset_seed,
-        batch_size=dk["batch_size"],
-        shuffle_buffer_size=dk["shuffle_buffer_size"],
+        batch_size=half_batch_size,
+        shuffle_buffer_size=shuffle_droid,
         num_parallel_calls=dk["num_parallel_calls"],
         train=True,
         action_chunk_size=dk["action_chunk_size"],
@@ -107,7 +123,54 @@ def main(_):
         action_norm_eps=float(dk.get("action_norm_eps", 1e-8)),
     )
     train_data_iter = train_data.iterator()
-    print("Data loader initialized")
+    print("DROID data loader initialized")
+
+    roboarena_data_iter = None
+    if use_roboarena:
+        # Create the RoboArena dataset
+        roboarena_train_data = RoboArenaDataset(
+            data_paths=ra_dk["data_paths"],
+            seed=dataset_seed,
+            batch_size=half_batch_size,
+            shuffle_buffer_size=shuffle_robo,
+            num_parallel_calls=ra_dk["num_parallel_calls"],
+            train=True,
+            action_chunk_size=ra_dk["action_chunk_size"],
+            action_joint_velocity_mean=ra_dk.get("action_joint_velocity_mean"),
+            action_joint_velocity_std=ra_dk.get("action_joint_velocity_std"),
+            action_norm_eps=float(ra_dk.get("action_norm_eps", 1e-8)),
+        )
+        roboarena_data_iter = roboarena_train_data.iterator()
+
+    def merge_batches(droid_batch, robo_batch):
+        """Build one training batch with half DROID + half RoboArena."""
+        droid_bsz = droid_batch["image"].shape[0]
+        robo_bsz = robo_batch["image"].shape[0]
+        merged = {
+            "image": np.concatenate([droid_batch["image"], robo_batch["image"]], axis=0),
+            "language_instruction": np.concatenate(
+                [droid_batch["language_instruction"], robo_batch["language_instruction"]],
+                axis=0,
+            ),
+            "action/joint_velocity_chunk": np.concatenate(
+                [
+                    droid_batch["action/joint_velocity_chunk"],
+                    robo_batch["action/joint_velocity_chunk"],
+                ],
+                axis=0,
+            ),
+            "distance": np.concatenate(
+                [droid_batch["distance"], robo_batch["value_target"]], axis=0
+            ),
+            "is_roboarena": np.concatenate(
+                [
+                    np.zeros((droid_bsz,), dtype=bool),
+                    np.ones((robo_bsz,), dtype=bool),
+                ],
+                axis=0,
+            ),
+        }
+        return merged
 
     # Create the language tokenizer
     tokenizer_load_path = FLAGS.config.tokenizer_load_path
@@ -281,6 +344,9 @@ def main(_):
             num_buckets=FLAGS.config.policy_kwargs["num_buckets"],
             discount_factor=FLAGS.config.policy_kwargs["discount_factor"],
             target_update_rate=FLAGS.config.policy_kwargs["target_update_rate"],
+            obs_dropout_prob=float(
+                FLAGS.config.policy_kwargs.get("obs_dropout_prob", 0.0)
+            ),
         )
     )
 
@@ -293,8 +359,18 @@ def main(_):
     )
     def update(train_state, batch, config, lr_schedule):
         def loss_fn(params, rng):
+            obs_p = float(config["obs_dropout_prob"])
             # Prepare the vit tokens
             image = jnp.astype(batch["image"], jnp.float32) / 127.5 - 1
+            if obs_p > 0:
+                rng, rng_drop = jax.random.split(rng)
+                B0 = batch["image"].shape[0]
+                drop_obs = jax.random.bernoulli(rng_drop, obs_p, (B0,))
+                image = jnp.where(
+                    drop_obs[:, None, None, None],
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                    image,
+                )
             image = jnp.astype(image, jnp.bfloat16)
             image = add_batch_sharding_constraint(image, where="image before vit")
             
@@ -326,7 +402,6 @@ def main(_):
                 action=batch["action/joint_velocity_chunk"],
                 name="action_projector",
             )  # (B, T_action, hidden_dim)
-            print_green(f"action_tokens shape: {action_tokens.shape}")
             action_tokens = add_batch_sharding_constraint(action_tokens, where="action_tokens")
 
             # embed the text tokens
@@ -343,7 +418,7 @@ def main(_):
             full_seq = add_batch_sharding_constraint(full_seq, where="full_seq")
 
             # Prepare full seq rope IDs
-            # Image tokens and action token both get rope_id=0 (no positional bias)
+            # Image tokens get rope_id=0 (since vit already has positional encoding)
             N_img = pre_llm_vit_tokens.shape[1]
             N_action = action_tokens.shape[1]
             image_rope_ids = jnp.zeros((N_img,), dtype=jnp.int32)[None, :]
@@ -371,9 +446,15 @@ def main(_):
             block_causal = jnp.tile(block_causal[None, ...], (full_seq.shape[0], 1, 1))
             block_causal = add_batch_sharding_constraint(block_causal, where="block_causal")
             # padding sees nothing, and is seen by nothing
-            # image and action tokens are never padding; only text tokens can be padded.
+            # Text tokens can be padded. When obs dropout applies, image tokens are padded too.
+            if obs_p > 0:
+                img_padding = jnp.broadcast_to(
+                    drop_obs[:, None], (full_seq.shape[0], N_img)
+                )
+            else:
+                img_padding = jnp.zeros((full_seq.shape[0], N_img), dtype=bool)
             padding = jnp.concatenate([
-                jnp.zeros((full_seq.shape[0], N_img), dtype=bool),
+                img_padding,
                 jnp.zeros((full_seq.shape[0], N_action), dtype=bool),
                 jnp.logical_not(batch["text_token_masks"]),
             ], axis=1)
@@ -409,9 +490,14 @@ def main(_):
             # get rid of singleton dimension
             value_logits = value_logits[:, 0]
 
-            # Construct cross-entropy targets
-            discounted_distances = jnp.power(config["discount_factor"], batch["distance"]) 
-            # this will have shape (B,), dtype float32, and contain values from 0 to 1
+            # Construct cross-entropy targets. DROID `distance` is timesteps-to-go; RoboArena `distance` is already a processed value in [0, 1] — use as-is.
+            dist_f = batch["distance"].astype(jnp.float32)
+            discounted_distances = jnp.where(
+                batch["is_roboarena"],
+                dist_f,
+                jnp.power(config["discount_factor"], dist_f),
+            )
+            # Shape (B,), float32; values suitable for bucketing (typically in [0, 1]).
             assert discounted_distances.shape == (post_llm_seq.shape[0],)
             assert discounted_distances.dtype == jnp.float32
             bucket_ids = jnp.clip((discounted_distances * config["num_buckets"]).astype(jnp.int32), min=0, max=config["num_buckets"]-1) # values in [0, config["num_buckets"]-1]
@@ -421,17 +507,45 @@ def main(_):
             # Critical: loss should be computed in float32
             value_logits = jnp.astype(value_logits, jnp.float32)
 
-            loss = optax.losses.softmax_cross_entropy_with_integer_labels(value_logits, value_targets)
-            loss = add_batch_sharding_constraint(loss, where="loss before pmean")
-            loss = jnp.mean(loss)
+            per_example_loss = optax.losses.softmax_cross_entropy_with_integer_labels(
+                value_logits, value_targets
+            )
+            per_example_loss = add_batch_sharding_constraint(per_example_loss, where="loss before pmean")
+            loss = jnp.mean(per_example_loss)
 
             # For logging, let's compute the accuracy in addition to the loss
             argmax_prediction_matches = jnp.argmax(value_logits, axis=-1) == value_targets
             accuracy = jnp.mean(argmax_prediction_matches)
+            is_roboarena = batch["is_roboarena"]
+            is_droid = jnp.logical_not(is_roboarena)
+
+            def masked_mean(values, mask):
+                mask_f = mask.astype(jnp.float32)
+                denom = jnp.maximum(jnp.sum(mask_f), 1.0)
+                return jnp.sum(values.astype(jnp.float32) * mask_f) / denom
+
+            roboarena_loss = masked_mean(per_example_loss, is_roboarena)
+            droid_loss = masked_mean(per_example_loss, is_droid)
+            roboarena_accuracy = masked_mean(argmax_prediction_matches, is_roboarena)
+            droid_accuracy = masked_mean(argmax_prediction_matches, is_droid)
+            roboarena_count = jnp.sum(is_roboarena.astype(jnp.int32))
+            droid_count = jnp.sum(is_droid.astype(jnp.int32))
+
+            if obs_p > 0:
+                obs_dropout_rate = jnp.mean(drop_obs.astype(jnp.float32))
+            else:
+                obs_dropout_rate = jnp.asarray(0.0, dtype=jnp.float32)
 
             log_dict = {
                 "loss": loss,
                 "accuracy": accuracy,
+                "roboarena_loss": roboarena_loss,
+                "droid_loss": droid_loss,
+                "roboarena_accuracy": roboarena_accuracy,
+                "droid_accuracy": droid_accuracy,
+                "roboarena_count": roboarena_count,
+                "droid_count": droid_count,
+                "obs_dropout_rate": obs_dropout_rate,
             }
 
             return loss, log_dict
@@ -474,7 +588,15 @@ def main(_):
             timer.tick("total")
 
             timer.tick("dataset")
-            batch = next(train_data_iter)
+            if use_roboarena:
+                droid_batch = next(train_data_iter)
+                robo_batch = next(roboarena_data_iter)
+                batch = merge_batches(droid_batch, robo_batch)
+                del droid_batch, robo_batch
+            else:
+                batch = next(train_data_iter)
+                bsz = batch["image"].shape[0]
+                batch["is_roboarena"] = np.zeros((bsz,), dtype=bool)
             batch = tokenize_and_pad(batch)
             batch = shard_data(batch)
             timer.tock("dataset")
