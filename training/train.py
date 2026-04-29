@@ -29,8 +29,7 @@ from bageljax.common.wandb import WandBLogger
 from bageljax.common.common import TrainState, ModuleDict, nonpytree_field
 from bageljax.common.optimizers import make_optimizer
 from bageljax.common.typing import Batch, PRNGKey
-from bageljax.data.dataset import Dataset
-from bageljax.data.roboarena_dataset import Dataset as RoboArenaDataset
+from bageljax.data.value_dataset import ValueDataset
 from bageljax.utils.timer_utils import Timer
 from bageljax.utils.jax_utils import host_broadcast_str, create_sharding, add_batch_sharding_constraint, enforce_sharding_constraints, initialize_compilation_cache
 from bageljax.model.vocabulary import TokenEmbedder, LogitsHead, ActionProjector
@@ -96,21 +95,15 @@ def main(_):
     dk = FLAGS.config.dataset_kwargs
     ra_dk = FLAGS.config.roboarena_dataset_kwargs
     total_batch_size = int(dk["batch_size"])
-    use_roboarena = bool(FLAGS.config.get("use_roboarena", True))
-    half_batch_size = total_batch_size // 2 if use_roboarena else total_batch_size
+    half_batch_size = total_batch_size // 2
 
-    # Reduce shuffle buffer size for each pipeline when mixing two sources to avoid OOM
     _min_shuffle = 2048
-    if use_roboarena:
-        shuffle_droid = max(_min_shuffle, int(dk["shuffle_buffer_size"]) // 2)
-        shuffle_robo = max(_min_shuffle, int(ra_dk["shuffle_buffer_size"]) // 2)
-        print(f"use_roboarena=True: shuffle_droid={shuffle_droid}, shuffle_robo={shuffle_robo}")
-    else:
-        shuffle_droid = max(_min_shuffle, int(dk["shuffle_buffer_size"]))
-        print(f"use_roboarena=False: shuffle_droid={shuffle_droid} (DROID only)")
+    shuffle_droid = max(_min_shuffle, int(dk["shuffle_buffer_size"]) // 2)
+    shuffle_robo = max(_min_shuffle, int(ra_dk["shuffle_buffer_size"]) // 2)
+    print(f"shuffle_droid={shuffle_droid}, shuffle_robo={shuffle_robo}")
 
-    # Create the training dataset
-    train_data = Dataset(
+    # Both DROID and RoboArena now share the same TFRecord format (ValueDataset).
+    droid_train_data = ValueDataset(
         data_paths=dk["data_paths"],
         seed=dataset_seed,
         batch_size=half_batch_size,
@@ -122,55 +115,43 @@ def main(_):
         action_joint_velocity_std=dk.get("action_joint_velocity_std"),
         action_norm_eps=float(dk.get("action_norm_eps", 1e-8)),
     )
-    train_data_iter = train_data.iterator()
+    droid_data_iter = droid_train_data.iterator()
     print("DROID data loader initialized")
 
-    roboarena_data_iter = None
-    if use_roboarena:
-        # Create the RoboArena dataset
-        roboarena_train_data = RoboArenaDataset(
-            data_paths=ra_dk["data_paths"],
-            seed=dataset_seed,
-            batch_size=half_batch_size,
-            shuffle_buffer_size=shuffle_robo,
-            num_parallel_calls=ra_dk["num_parallel_calls"],
-            train=True,
-            action_chunk_size=ra_dk["action_chunk_size"],
-            action_joint_velocity_mean=ra_dk.get("action_joint_velocity_mean"),
-            action_joint_velocity_std=ra_dk.get("action_joint_velocity_std"),
-            action_norm_eps=float(ra_dk.get("action_norm_eps", 1e-8)),
-        )
-        roboarena_data_iter = roboarena_train_data.iterator()
+    roboarena_train_data = ValueDataset(
+        data_paths=ra_dk["data_paths"],
+        seed=dataset_seed,
+        batch_size=half_batch_size,
+        shuffle_buffer_size=shuffle_robo,
+        num_parallel_calls=ra_dk["num_parallel_calls"],
+        train=True,
+        action_chunk_size=ra_dk["action_chunk_size"],
+        action_joint_velocity_mean=ra_dk.get("action_joint_velocity_mean"),
+        action_joint_velocity_std=ra_dk.get("action_joint_velocity_std"),
+        action_norm_eps=float(ra_dk.get("action_norm_eps", 1e-8)),
+    )
+    roboarena_data_iter = roboarena_train_data.iterator()
+    print("RoboArena data loader initialized")
 
     def merge_batches(droid_batch, robo_batch):
         """Build one training batch with half DROID + half RoboArena."""
         droid_bsz = droid_batch["image"].shape[0]
         robo_bsz = robo_batch["image"].shape[0]
-        merged = {
+        return {
             "image": np.concatenate([droid_batch["image"], robo_batch["image"]], axis=0),
             "language_instruction": np.concatenate(
-                [droid_batch["language_instruction"], robo_batch["language_instruction"]],
-                axis=0,
+                [droid_batch["language_instruction"], robo_batch["language_instruction"]], axis=0,
             ),
             "action/joint_velocity_chunk": np.concatenate(
-                [
-                    droid_batch["action/joint_velocity_chunk"],
-                    robo_batch["action/joint_velocity_chunk"],
-                ],
-                axis=0,
+                [droid_batch["action/joint_velocity_chunk"], robo_batch["action/joint_velocity_chunk"]], axis=0,
             ),
-            "distance": np.concatenate(
-                [droid_batch["distance"], robo_batch["value_target"]], axis=0
+            "value_target": np.concatenate(
+                [droid_batch["value_target"], robo_batch["value_target"]], axis=0,
             ),
             "is_roboarena": np.concatenate(
-                [
-                    np.zeros((droid_bsz,), dtype=bool),
-                    np.ones((robo_bsz,), dtype=bool),
-                ],
-                axis=0,
+                [np.zeros((droid_bsz,), dtype=bool), np.ones((robo_bsz,), dtype=bool)], axis=0,
             ),
         }
-        return merged
 
     # Create the language tokenizer
     tokenizer_load_path = FLAGS.config.tokenizer_load_path
@@ -185,7 +166,7 @@ def main(_):
         # and then tokenize. It will also left-pad the text to the max length, and assign RoPE IDs.
 
         PAD_TOKEN_ID = 0 # it doesn't really matter what this is
-        MAX_PROMPT_LENGTH = FLAGS.config.dataset_kwargs["max_prompt_length"]
+        MAX_PROMPT_LENGTH = FLAGS.config.roboarena_dataset_kwargs["max_prompt_length"]
 
         B = batch["image"].shape[0]
         batch_tokenized_language = []
@@ -245,7 +226,7 @@ def main(_):
         "vision_encoder": VisionEncoder(),
         "action_projector": ActionProjector(action_dim=8),
         "mixture_of_transformers": MixtureOfTransformers(),
-        "logits_head": LogitsHead(),
+        "logits_head": LogitsHead(vocab_size=FLAGS.config.policy_kwargs["num_buckets"]),
     }
 
     model_def = ModuleDict(networks)
@@ -279,7 +260,7 @@ def main(_):
                                         jnp.zeros((B, H, W, 3), dtype=jnp.bfloat16),
                                     ],
                                     action_projector = [
-                                        jnp.zeros((B, FLAGS.config.dataset_kwargs["action_chunk_size"], 8), dtype=jnp.float32),
+                                        jnp.zeros((B, FLAGS.config.roboarena_dataset_kwargs["action_chunk_size"], 8), dtype=jnp.float32),
                                     ],
                                     mixture_of_transformers = [
                                         jnp.zeros((B, L, llm_hidden_dim), dtype=jnp.bfloat16),
@@ -483,39 +464,33 @@ def main(_):
                 hidden_states=post_llm_value_token,
                 name="logits_head",
             )
-            # this should have shape (B, 1, 512)
-            assert value_logits.shape == (post_llm_seq.shape[0], 1, 512)
+            # this should have shape (B, 1, num_bins)
+            num_bins = config["num_buckets"]
+            assert value_logits.shape == (post_llm_seq.shape[0], 1, num_bins)
             assert value_logits.dtype == jnp.bfloat16
             value_logits = add_batch_sharding_constraint(value_logits, where="value_logits")
             # get rid of singleton dimension
             value_logits = value_logits[:, 0]
 
-            # Construct cross-entropy targets. DROID `distance` is timesteps-to-go; RoboArena `distance` is already a processed value in [0, 1] — use as-is.
-            dist_f = batch["distance"].astype(jnp.float32)
-            discounted_distances = jnp.where(
-                batch["is_roboarena"],
-                dist_f,
-                jnp.power(config["discount_factor"], dist_f),
-            )
-            # Shape (B,), float32; values suitable for bucketing (typically in [0, 1]).
-            assert discounted_distances.shape == (post_llm_seq.shape[0],)
-            assert discounted_distances.dtype == jnp.float32
-            bucket_ids = jnp.clip((discounted_distances * config["num_buckets"]).astype(jnp.int32), min=0, max=config["num_buckets"]-1) # values in [0, config["num_buckets"]-1]
-            value_targets = config["num_buckets"] - bucket_ids - 1 # reverse so that closer distances have lower bucket ids
-            value_targets = add_batch_sharding_constraint(value_targets, where="value_targets")
+            # RoboArena supplies a pre-computed distribution over bins — shape (B, num_bins).
+            reward_dist = batch["value_target"].astype(jnp.float32)
+            assert reward_dist.shape == (post_llm_seq.shape[0], num_bins)
+            reward_dist = add_batch_sharding_constraint(reward_dist, where="reward_dist")
 
             # Critical: loss should be computed in float32
             value_logits = jnp.astype(value_logits, jnp.float32)
 
-            per_example_loss = optax.losses.softmax_cross_entropy_with_integer_labels(
-                value_logits, value_targets
-            )
+            # Soft cross-entropy: targets are a distribution rather than a hard integer label.
+            per_example_loss = optax.losses.softmax_cross_entropy(value_logits, reward_dist)
             per_example_loss = add_batch_sharding_constraint(per_example_loss, where="loss before pmean")
             loss = jnp.mean(per_example_loss)
 
-            # For logging, let's compute the accuracy in addition to the loss
-            argmax_prediction_matches = jnp.argmax(value_logits, axis=-1) == value_targets
+            # Accuracy: argmax of predicted logits vs argmax of the target distribution.
+            argmax_prediction_matches = (
+                jnp.argmax(value_logits, axis=-1) == jnp.argmax(reward_dist, axis=-1)
+            )
             accuracy = jnp.mean(argmax_prediction_matches)
+
             is_roboarena = batch["is_roboarena"]
             is_droid = jnp.logical_not(is_roboarena)
 
@@ -528,8 +503,6 @@ def main(_):
             droid_loss = masked_mean(per_example_loss, is_droid)
             roboarena_accuracy = masked_mean(argmax_prediction_matches, is_roboarena)
             droid_accuracy = masked_mean(argmax_prediction_matches, is_droid)
-            roboarena_count = jnp.sum(is_roboarena.astype(jnp.int32))
-            droid_count = jnp.sum(is_droid.astype(jnp.int32))
 
             if obs_p > 0:
                 obs_dropout_rate = jnp.mean(drop_obs.astype(jnp.float32))
@@ -543,8 +516,6 @@ def main(_):
                 "droid_loss": droid_loss,
                 "roboarena_accuracy": roboarena_accuracy,
                 "droid_accuracy": droid_accuracy,
-                "roboarena_count": roboarena_count,
-                "droid_count": droid_count,
                 "obs_dropout_rate": obs_dropout_rate,
             }
 
@@ -588,15 +559,10 @@ def main(_):
             timer.tick("total")
 
             timer.tick("dataset")
-            if use_roboarena:
-                droid_batch = next(train_data_iter)
-                robo_batch = next(roboarena_data_iter)
-                batch = merge_batches(droid_batch, robo_batch)
-                del droid_batch, robo_batch
-            else:
-                batch = next(train_data_iter)
-                bsz = batch["image"].shape[0]
-                batch["is_roboarena"] = np.zeros((bsz,), dtype=bool)
+            droid_batch = next(droid_data_iter)
+            robo_batch = next(roboarena_data_iter)
+            batch = merge_batches(droid_batch, robo_batch)
+            del droid_batch, robo_batch
             batch = tokenize_and_pad(batch)
             batch = shard_data(batch)
             timer.tock("dataset")
