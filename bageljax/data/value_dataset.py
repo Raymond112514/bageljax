@@ -11,9 +11,12 @@ from absl import logging
 
 from bageljax.data.data_utils import binarize_gripper_action, normalize_joint_velocity_7d
 
-# Actions are pre-chunked at 10 inner timesteps per outer step.
-PRE_CHUNK_SIZE = 10
+# Default pre-chunk sizes (overridable per dataset via constructor).
+_DEFAULT_PRE_CHUNK_SIZE = 10
+_DEFAULT_NUM_REWARD_BINS = 10
 
+def print_green(message):
+    print(f"\033[92m{message}\033[0m")
 
 class ValueDataset:
     IMG_KEYS = (
@@ -44,6 +47,8 @@ class ValueDataset:
         train: bool = True,
         num_parallel_calls: int = 10,
         action_chunk_size: int = 30,
+        pre_chunk_size: int = _DEFAULT_PRE_CHUNK_SIZE,
+        num_reward_bins: int = _DEFAULT_NUM_REWARD_BINS,
         action_joint_velocity_mean: Optional[Sequence[float]] = None,
         action_joint_velocity_std: Optional[Sequence[float]] = None,
         action_norm_eps: float = 1e-8,
@@ -66,6 +71,8 @@ class ValueDataset:
         self.batch_size = int(batch_size)
         self.seed = int(seed)
         self.action_chunk_size = int(action_chunk_size)
+        self._pre_chunk_size = int(pre_chunk_size)
+        self._num_reward_bins = int(num_reward_bins)
 
         if action_joint_velocity_mean is not None and action_joint_velocity_std is not None:
             mean = np.asarray(action_joint_velocity_mean, dtype=np.float32)
@@ -180,7 +187,7 @@ class ValueDataset:
         ds = ds.filter(self._filter_by_len)
         ds = ds.map(self._add_next_step_reward_targets, num_parallel_calls=self.num_parallel_calls)
         ds = ds.map(self._add_action_chunks, num_parallel_calls=self.num_parallel_calls)
-
+        
         # Unbatch to individual transitions
         ds = ds.unbatch()
 
@@ -188,7 +195,6 @@ class ValueDataset:
         ds = ds.map(self._select_language_instr, num_parallel_calls=self.num_parallel_calls)
         ds = ds.filter(self._lang_filter_fn)
         ds = ds.map(self._stack_and_reshape_images, num_parallel_calls=self.num_parallel_calls)
-
         opts = tf.data.Options()
         opts.autotune.enabled = True
         opts.experimental_deterministic = not self.is_train
@@ -244,11 +250,11 @@ class ValueDataset:
         for k in self.F32_SERIALIZED_KEYS:
             out[k] = tf.io.parse_tensor(parsed[k], out_type=tf.float32)
             if k == "action/joint_velocity":
-                out[k] = tf.ensure_shape(out[k], [None, PRE_CHUNK_SIZE, 7])
+                out[k] = tf.ensure_shape(out[k], [None, self._pre_chunk_size, 7])
             elif k == "rewards":
-                out[k] = tf.ensure_shape(out[k], [None, 10])  # (T, num_bins)
+                out[k] = tf.ensure_shape(out[k], [None, self._num_reward_bins])
             else:
-                out[k] = tf.ensure_shape(out[k], [None, PRE_CHUNK_SIZE])
+                out[k] = tf.ensure_shape(out[k], [None, self._pre_chunk_size])
 
         for k in self.STR_KEYS:
             out[k] = parsed[k]  # scalar tf.string
@@ -265,9 +271,9 @@ class ValueDataset:
 
         # 7D velocity + 1D binarized gripper -> 8D action.
         grip_bin = binarize_gripper_action(out["action/gripper_position"])
-        grip_bin = tf.reshape(grip_bin, tf.stack([T, tf.constant(PRE_CHUNK_SIZE)]))
+        grip_bin = tf.reshape(grip_bin, tf.stack([T, tf.constant(self._pre_chunk_size)]))
         del out["action/gripper_position"]
-        jv = out["action/joint_velocity"]  # [T, PRE_CHUNK_SIZE, 7]
+        jv = out["action/joint_velocity"]  # [T, pre_chunk_size, 7]
         if self._normalize_joint_velocity:
             jv = normalize_joint_velocity_7d(jv, self._jv_mean, self._jv_std, self._jv_eps)
         out["action/joint_velocity"] = tf.concat(
@@ -283,7 +289,7 @@ class ValueDataset:
 
     def _filter_by_len(self, traj):
         traj_len = tf.shape(traj[self.IMG_KEYS[0]])[0]
-        k_outer = self.action_chunk_size // PRE_CHUNK_SIZE
+        k_outer = self.action_chunk_size // self._pre_chunk_size
         return traj_len >= k_outer + 1
 
     def _add_next_step_reward_targets(self, traj):
@@ -324,14 +330,14 @@ class ValueDataset:
         that is value_target[t + k_outer - 1] per row.
         """
         micro_k = int(self.action_chunk_size)
-        if micro_k % PRE_CHUNK_SIZE != 0:
+        if micro_k % self._pre_chunk_size != 0:
             raise ValueError(
-                f"action_chunk_size ({micro_k}) must be divisible by PRE_CHUNK_SIZE "
-                f"({PRE_CHUNK_SIZE})."
+                f"action_chunk_size ({micro_k}) must be divisible by pre_chunk_size "
+                f"({self._pre_chunk_size})."
             )
-        k_outer = micro_k // PRE_CHUNK_SIZE
+        k_outer = micro_k // self._pre_chunk_size
 
-        actions = traj["action/joint_velocity"]  # [T, PRE_CHUNK_SIZE, 8]
+        actions = traj["action/joint_velocity"]  # [T, pre_chunk_size, 8]
         T = tf.shape(actions)[0]
 
         valid_T = T - k_outer + 1
@@ -344,10 +350,6 @@ class ValueDataset:
             gathered,
             tf.stack([valid_T, tf.constant(micro_k, dtype=tf.int32), tf.constant(8, dtype=tf.int32)]),
         )  # [valid_T, micro_k, 8]
-
-        # value_target is (T, 10); slice along axis 0.
-        vt = traj["value_target"]
-        traj["value_target"] = tf.slice(vt, begin=[k_outer - 1], size=[valid_T])
 
         for k in list(traj.keys()):
             if k == "action/joint_velocity":

@@ -111,6 +111,8 @@ def main(_):
         num_parallel_calls=dk["num_parallel_calls"],
         train=True,
         action_chunk_size=dk["action_chunk_size"],
+        pre_chunk_size=int(dk.get("pre_chunk_size", 10)),
+        num_reward_bins=int(FLAGS.config.policy_kwargs["num_buckets"]),
         action_joint_velocity_mean=dk.get("action_joint_velocity_mean"),
         action_joint_velocity_std=dk.get("action_joint_velocity_std"),
         action_norm_eps=float(dk.get("action_norm_eps", 1e-8)),
@@ -126,6 +128,8 @@ def main(_):
         num_parallel_calls=ra_dk["num_parallel_calls"],
         train=True,
         action_chunk_size=ra_dk["action_chunk_size"],
+        pre_chunk_size=int(ra_dk.get("pre_chunk_size", 10)),
+        num_reward_bins=int(FLAGS.config.policy_kwargs["num_buckets"]),
         action_joint_velocity_mean=ra_dk.get("action_joint_velocity_mean"),
         action_joint_velocity_std=ra_dk.get("action_joint_velocity_std"),
         action_norm_eps=float(ra_dk.get("action_norm_eps", 1e-8)),
@@ -166,7 +170,7 @@ def main(_):
         # and then tokenize. It will also left-pad the text to the max length, and assign RoPE IDs.
 
         PAD_TOKEN_ID = 0 # it doesn't really matter what this is
-        MAX_PROMPT_LENGTH = FLAGS.config.roboarena_dataset_kwargs["max_prompt_length"]
+        MAX_PROMPT_LENGTH = FLAGS.config.dataset_kwargs["max_prompt_length"]
 
         B = batch["image"].shape[0]
         batch_tokenized_language = []
@@ -293,13 +297,17 @@ def main(_):
     checkpointer = ocp.Checkpointer(ocp.StandardCheckpointHandler())
 
     # Load from pre-trained Bagel checkpoint.
-    # Orbax restore requires an exact pytree key match, so we strip the action_projector out first,
-    # restore the remaining weights, then add the fresh action_projector params back.
     fresh_params = unfreeze(train_state.params)
     params_for_restore = {k: v for k, v in fresh_params.items() if k != "modules_action_projector"}
-    restored_params = checkpointer.restore(FLAGS.config.pretrained_bagel_path, params_for_restore)
+
+    restored_params = checkpointer.restore(
+        FLAGS.config.pretrained_bagel_path,
+        args=ocp.args.StandardRestore(params_for_restore, strict=False),
+    )
     restored_params = unfreeze(restored_params)  # ensure plain dict regardless of orbax version
+    # Restore fresh (randomly initialized) modules that are not in / differ from the checkpoint.
     restored_params["modules_action_projector"] = fresh_params["modules_action_projector"]
+    restored_params["modules_logits_head"] = fresh_params["modules_logits_head"]
     train_state = train_state.replace(params=restored_params)
 
     # Update target params
@@ -322,7 +330,7 @@ def main(_):
     # Create auxiliary objects for use by update function
     config = flax.core.FrozenDict(
         dict(
-            num_buckets=FLAGS.config.policy_kwargs["num_buckets"],
+            num_buckets=int(FLAGS.config.policy_kwargs["num_buckets"]),
             discount_factor=FLAGS.config.policy_kwargs["discount_factor"],
             target_update_rate=FLAGS.config.policy_kwargs["target_update_rate"],
             obs_dropout_prob=float(
@@ -577,12 +585,12 @@ def main(_):
 
             if step % FLAGS.config.save_interval == 0 or step == 20:
                 print_green(f"[process={jax.process_index()}] About to save checkpoint at step {step}")
-                jax.block_until_ready(train_state)
+                # jax.block_until_ready(train_state)
                 save_ckpt(save_dir, step, train_state)
                 print_green(f"[process={jax.process_index()}] Checkpoint saved at step {step}")
 
             if step % FLAGS.config.log_interval == 0:
-                jax.block_until_ready(train_state)
+                # jax.block_until_ready(train_state)
                 if jax.process_index() == 0:
                     update_info = jax.device_get(update_info)
                     wandb_logger.log({"training": update_info}, step=step)

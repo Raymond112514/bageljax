@@ -12,7 +12,7 @@ def get_config(config_string):
     base_config = dict(
         num_steps=int(1000000),
         log_interval=100,
-        save_interval=1000,
+        save_interval=500,
         save_dir="gs://raymond-us-west1/value_function_logs",
         resume_path=None,
         pretrained_bagel_path="gs://raymond-us-west1/value_function_starting_components/bagel",
@@ -23,11 +23,12 @@ def get_config(config_string):
     )
 
     base_data_config = dict(
-        data_paths=["gs://raymond-us-west1/droid/success/*.tfrecord"],
+        data_paths=["gs://raymond-us-west1/droid_labeled_distribution/success_renamed/*.tfrecord"],
         batch_size=12,
         shuffle_buffer_size=100000,
         num_parallel_calls=10,
         action_chunk_size=30,
+        pre_chunk_size=30,
         max_prompt_length=224, # accounts for num tokens in longest prompt, the rewriting of the instruction, and the pad tokens needed to make global seq len a multiple of 128
         # Normalization for first 7 dims of 8D action (joint velocity); gripper stays ±1.
         action_joint_velocity_mean=list(ACTION_JOINT_VELOCITY_MEAN),
@@ -35,7 +36,7 @@ def get_config(config_string):
         action_norm_eps=ACTION_NORM_EPS,
     )
 
-    _ROBOARENA_PREFIX = "gs://raymond-us-west1/droid_labeled/roboarena_renamed"
+    _ROBOARENA_PREFIX = "gs://raymond-us-west1/droid_labeled_distribution/roboarena_renamed"
     _ROBOARENA_SHARD_BASENAME = "roboarena"
     _roboarena_shard_paths = [
         f"{_ROBOARENA_PREFIX}/{_ROBOARENA_SHARD_BASENAME}-{i:05d}.tfrecord"
@@ -45,13 +46,14 @@ def get_config(config_string):
     roboarena_data_config = {
         **base_data_config,
         "data_paths": [_roboarena_shard_paths],
+        "pre_chunk_size": 10,
     }
 
     possible_structures = {
         "bagel_value_function": ConfigDict(
             dict(
                 policy_kwargs=dict(
-                    num_buckets=64,
+                    num_buckets=10,
                     discount_factor=0.993,
                     learning_rate=1e-4, 
                     weight_decay=0.0,
