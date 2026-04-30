@@ -8,7 +8,11 @@ from absl import logging
 from bageljax.data.data_utils import binarize_gripper_action, normalize_joint_velocity_7d
 
 class Dataset:
-    IMG_KEYS = ("shoulder_image_1",)
+    IMG_KEYS = (
+        "wrist_image",
+        "shoulder_image_1",
+        "shoulder_image_2",
+    )
     F32_KEYS = (
         "action/joint_velocity",
         "action/cartesian_velocity",
@@ -384,16 +388,22 @@ class Dataset:
         return keep
     
     def _stack_and_reshape_images(self, transition):
-        img = transition["shoulder_image_1"]
-        img = tf.ensure_shape(img, [288, 512, 3])
+        random_number = tf.random.uniform((1,), maxval=2, dtype=tf.int32)[0]
+        shoulder = transition["shoulder_image_1"]
+        shoulder = tf.where(random_number == 1, transition["shoulder_image_2"], shoulder)
+        wrist = transition["wrist_image"]
 
-        img = tf.cast(
-            tf.round(tf.image.resize(img, (672, 560), method="bicubic")),
+        shoulder_and_wrist = tf.concat([shoulder, wrist], axis=0)
+        shoulder_and_wrist = tf.ensure_shape(shoulder_and_wrist, [576, 512, 3])
+        shoulder_and_wrist = tf.cast(
+            tf.round(tf.image.resize(shoulder_and_wrist, (672, 560), method="bicubic")),
             tf.uint8,
         )
 
-        transition["image"] = img
+        transition["image"] = shoulder_and_wrist
+        del transition["wrist_image"]
         del transition["shoulder_image_1"]
+        del transition["shoulder_image_2"]
 
         return transition
 

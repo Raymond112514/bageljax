@@ -1,5 +1,4 @@
 import fnmatch
-import os
 from typing import Iterable, List, Optional, Sequence, Union
 
 import numpy as np
@@ -8,26 +7,31 @@ from absl import logging
 
 from bageljax.data.data_utils import binarize_gripper_action, normalize_joint_velocity_7d
 
+# The roboarena dataset is pre-chunked at 10 timesteps. 
+PRE_CHUNK_SIZE = 10 
+
 class Dataset:
     IMG_KEYS = (
-        "wrist_image",
         "shoulder_image_1",
     )
+    F32_SERIALIZED_KEYS = (
+        "action/joint_velocity",
+        "action/gripper_position",
+    )
+    # Stored as raw float lists in TFRecords (VarLenFeature), not serialized tensors.
     F32_KEYS = (
         "action/joint_velocity",
-        "action/gripper_position",  
+        "action/gripper_position",
+        "rewards",
     )
     STR_KEYS = (
         "language_instruction1",
-        "language_instruction2",
-        "language_instruction3",
     )
 
     def __init__(
         self,
         data_paths: List[Union[str, List[str]]],
         seed: int,
-        label_data_paths: Optional[List[Union[str, List[str]]]] = None,
         sample_weights: Optional[List[float]] = None,
         batch_size: int = 10,
         shuffle_buffer_size: int = 10000,
@@ -40,13 +44,8 @@ class Dataset:
         **kwargs,
     ):
         logging.warning("Extra kwargs passed to Dataset: %s", kwargs)
-        assert label_data_paths is not None, "label_data_paths must not be None for RoboArena dataset."
         if isinstance(data_paths[0], str):
             data_paths = [data_paths]
-        if isinstance(label_data_paths[0], str):
-            label_data_paths = [label_data_paths]
-        if len(label_data_paths) != len(data_paths):
-            raise ValueError("label_data_paths must match data_paths structure.")
         if sample_weights is None:
             # default to uniform distribution over sub-lists
             sample_weights = [1 / len(data_paths)] * len(data_paths)
@@ -95,7 +94,6 @@ class Dataset:
             sub_ds = self._construct_tf_dataset(
                 sub_paths,
                 subdataset_index=i,
-                label_paths=label_data_paths[i],
             )
 
             # Shuffle each subdataset
@@ -143,7 +141,7 @@ class Dataset:
         dataset = dataset.with_options(opts)
 
         self.tf_dataset = dataset
-
+        
     # --------------------------------------------------------------------- #
     # Internal construction of a single (sub-)dataset                       #
     # --------------------------------------------------------------------- #
@@ -162,31 +160,17 @@ class Dataset:
 
         all_paths = sorted(set(all_paths))
         return all_paths
-
-    def _construct_tf_dataset(
-        self,
-        paths: List[str],
-        subdataset_index: int,
-        label_paths: List[str],
-    ) -> tf.data.Dataset:
+    
+    def _construct_tf_dataset(self, paths: List[str], subdataset_index: int,) -> tf.data.Dataset:
         """
         Constructs a tf.data.Dataset from a list of path/glob strings.
         The dataset yields a dictionary of tensors for each transition.
         """
         all_paths = self._expand_and_check_paths(paths)
-        all_label_paths = self._expand_and_check_paths(label_paths)
-        label_by_basename = {os.path.basename(p): p for p in all_label_paths}
-        aligned_label_paths = []
-        for p in all_paths:
-            basename = os.path.basename(p)
-            if basename not in label_by_basename:
-                raise ValueError(f"Missing label shard for raw shard: {basename}")
-            aligned_label_paths.append(label_by_basename[basename])
-        all_label_paths = aligned_label_paths
 
         # Dataset of file paths. For training we shuffle + reshuffle each "epoch";
         # for validation we keep a fixed, sorted order.
-        path_ds = tf.data.Dataset.from_tensor_slices((all_paths, all_label_paths))
+        path_ds = tf.data.Dataset.from_tensor_slices(all_paths)
         if self.is_train and len(all_paths) > 1:
             path_seed = self._path_shuffle_base_seed + (
                 self._subdataset_seed_stride * subdataset_index
@@ -198,22 +182,19 @@ class Dataset:
             )
 
         # Stream records from all shards in parallel.
-        def _read_shard_pair(raw_path, label_path):
-            raw_ds = tf.data.TFRecordDataset(raw_path)
-            label_ds = tf.data.TFRecordDataset(label_path)
-            return tf.data.Dataset.zip((raw_ds, label_ds))
-
-        ds = path_ds.flat_map(_read_shard_pair)
+        ds = tf.data.TFRecordDataset(
+            path_ds,
+            num_parallel_reads=self.num_parallel_calls,
+        )
 
         # Trajectory-level pipeline -----------------------------------------
         ds = ds.map(
-            self._decode_example_with_label,
+            self._decode_example,
             num_parallel_calls=self.num_parallel_calls,
         )
         ds = ds.filter(self._filter_by_len)
-        ds = ds.filter(self._filter_by_action_chunk_len)
         ds = ds.map(
-            self._add_distances,
+            self._add_next_step_reward_targets,
             num_parallel_calls=self.num_parallel_calls,
         )
         ds = ds.map(
@@ -242,7 +223,7 @@ class Dataset:
         ds = ds.with_options(opts)
 
         return ds
-    
+
     # --------------------------------------------------------------------- #
     # Decoding / trajectory-level transforms                                #
     # --------------------------------------------------------------------- #
@@ -268,20 +249,22 @@ class Dataset:
         # Enforce the known image size; will raise if any frame disagrees.
         frames = tf.ensure_shape(frames, [None, 288, 512, 3])
         return frames
-
+    
     def _decode_example(self, serialized_example: tf.Tensor) -> dict:
         """
         Graph-friendly parser that enforces presence of all required fields.
         Returns TF tensors only:
         - images: uint8 [T, 288, 512, 3]
         - float tensors: parsed from serialized tensors (dtype float32)
+        - rewards: float32 [T] (same T as images)
         - strings: scalar tf.string
         """
         # For lists-of-bytes (JPEG frames) we must use VarLenFeature.
         # For required scalars, omit default_value -> parse_single_example errors if missing.
         feature_spec = {
             **{k: tf.io.VarLenFeature(tf.string) for k in self.IMG_KEYS},
-            **{k: tf.io.FixedLenFeature([], tf.string) for k in self.F32_KEYS},  # required
+            **{k: tf.io.FixedLenFeature([], tf.string) for k in self.F32_SERIALIZED_KEYS},
+            "rewards": tf.io.VarLenFeature(tf.float32),
             **{k: tf.io.FixedLenFeature([], tf.string) for k in self.STR_KEYS},  # required
         }
 
@@ -293,12 +276,16 @@ class Dataset:
             out[k] = self._decode_jpeg_sequence(parsed[k])  # [T, 288, 512, 3] uint8
 
         # Parse serialized float tensors (required); dtype is float32.
-        for k in self.F32_KEYS:
+        for k in self.F32_SERIALIZED_KEYS:
             out[k] = tf.io.parse_tensor(parsed[k], out_type=tf.float32)
-            if k == "action/gripper_position":
-                out[k] = tf.reshape(out[k], [-1])  # [T]
+            if k == "action/joint_velocity":
+                out[k] = tf.ensure_shape(out[k], [None, PRE_CHUNK_SIZE, 7])
             else:
-                out[k] = tf.ensure_shape(out[k], [None, None])
+                out[k] = tf.ensure_shape(out[k], [None, PRE_CHUNK_SIZE])
+
+        rewards_sp = tf.sparse.reorder(parsed["rewards"])
+        out["rewards"] = tf.reshape(tf.sparse.to_dense(rewards_sp), [-1])
+        out["rewards"] = tf.ensure_shape(out["rewards"], [None])
 
         # Strings (required)
         for k in self.STR_KEYS:
@@ -307,7 +294,6 @@ class Dataset:
         # --- sanity check: ensure time dim matches image T ---------------------------
         T = tf.shape(out[self.IMG_KEYS[0]])[0]
         for k in self.F32_KEYS:
-            # Attach the assertion without replacing the tensor with an op.
             with tf.control_dependencies([
                 tf.debugging.assert_equal(
                     tf.shape(out[k])[0], T, message=f"{k} length != image T"
@@ -316,15 +302,16 @@ class Dataset:
                 out[k] = tf.identity(out[k])  # keeps it a Tensor
 
         # Full-trajectory gripper binarization, then 7D velocity + 1D gripper -> 8D action.
-        grip_bin = binarize_gripper_action(out["action/gripper_position"])
+        grip_bin = binarize_gripper_action(out["action/gripper_position"]) 
+        grip_bin = tf.reshape(grip_bin, tf.stack([T, tf.constant(PRE_CHUNK_SIZE)]))
         del out["action/gripper_position"]
-        jv = out["action/joint_velocity"]  # [T, 7]
+        jv = out["action/joint_velocity"]  # [T, PRE_CHUNK_SIZE, 7]
         if self._normalize_joint_velocity:
             jv = normalize_joint_velocity_7d(jv, self._jv_mean, self._jv_std, self._jv_eps)
         out["action/joint_velocity"] = tf.concat(
-            [jv, grip_bin[:, tf.newaxis]],
+            [jv, grip_bin[:, :, tf.newaxis]],
             axis=-1,
-        )  # [T, 8]
+        )  # [T, PRE_CHUNK_SIZE, 8]
 
         T = tf.shape(out[self.IMG_KEYS[0]])[0]  # time length after mask
         # Repeat language strings to enable unbatching later
@@ -333,95 +320,107 @@ class Dataset:
             out[k] = tf.fill([T], out[k])        # -> shape [T]
 
         return out
-
-    def _decode_example_with_label(
-        self,
-        serialized_raw_example: tf.Tensor,
-        serialized_label_example: tf.Tensor,
-    ) -> dict:
-        out = self._decode_example(serialized_raw_example)
-
-        raw_meta = tf.io.parse_single_example(
-            serialized_raw_example,
-            {"rel_path": tf.io.FixedLenFeature([], tf.string)},
-        )
-        label_meta = tf.io.parse_single_example(
-            serialized_label_example,
-            {
-                "rel_path": tf.io.FixedLenFeature([], tf.string),
-                "partial_success": tf.io.FixedLenFeature([1], tf.float32),
-            },
-        )
-
-        with tf.control_dependencies(
-            [
-                tf.debugging.assert_equal(
-                    raw_meta["rel_path"],
-                    label_meta["rel_path"],
-                    message="raw/label rel_path mismatch",
-                )
-            ]
-        ):
-            partial_progress = tf.identity(label_meta["partial_success"][0])
-
-        T = tf.shape(out[self.IMG_KEYS[0]])[0]
-        out["partial_progress"] = tf.fill([T], partial_progress)
-        return out
     
     def _filter_by_len(self, traj):
         traj_len = tf.shape(traj[self.IMG_KEYS[0]])[0]
-        # Return a boolean indicating whether to keep this example
-        return traj_len >= 20
-
-    def _filter_by_action_chunk_len(self, traj):
-        traj_len = tf.shape(traj[self.IMG_KEYS[0]])[0]
-        return traj_len >= self.action_chunk_size
+        k_outer = self.action_chunk_size // PRE_CHUNK_SIZE
+        # Need T >= k_outer + 1 so that after _add_next_step_reward_targets (length T-1)
+        # we still have at least k_outer outer steps for chunking (valid_T >= 1).
+        return traj_len >= k_outer + 1
     
-    def _add_distances(self, traj):
+    def _add_next_step_reward_targets(self, traj):
+        """Align value prediction target r_{i+1} with (s_i, a_i)."""
         T = tf.shape(traj[self.IMG_KEYS[0]])[0]
-        traj["distance"] = T - tf.range(T, dtype=tf.int32)
+        with tf.control_dependencies([
+            tf.debugging.assert_greater_equal(
+                T,
+                2,
+                message="Trajectory length must be >= 2 to pair (s_i, a_i) with r_{i+1}.",
+            )
+        ]):
+            tmax = T - 1
+        for k in self.IMG_KEYS:
+            traj[k] = traj[k][:tmax]
+        traj["action/joint_velocity"] = traj["action/joint_velocity"][:tmax]
+        rewards = traj["rewards"]
+        traj["value_target"] = rewards[1:]
+        del traj["rewards"]
+        for k in self.STR_KEYS:
+            traj[k] = traj[k][:tmax]
+            
+        # --- sanity check: ensure time dim matches image T ---------------------------
+        T = tf.shape(traj[self.IMG_KEYS[0]])[0]
+        for k, v in traj.items():
+            with tf.control_dependencies([
+                tf.debugging.assert_equal(
+                    tf.shape(v)[0], T, message=f"{k}: time dim != image time dim"
+                )
+            ]):
+                traj[k] = tf.identity(v)
         return traj
-
+    
     def _add_action_chunks(self, traj):
-        """Build fixed-length future action chunks and drop invalid tail states."""
-        actions = traj["action/joint_velocity"]  # [T, D]
+        """Build fixed-length action windows for pre-chunked actions.
+
+        For window start t with outer blocks a_t..a_{t+k_outer-1}, align the
+        value target with r_{t+k_outer} (reward after the last block), not
+        r_{t+1}. With value_target[j]=r_{j+1} from _add_next_step_reward_targets,
+        that is value_target[t + k_outer - 1] per row.
+        """
+        micro_k = int(self.action_chunk_size)
+        if micro_k % PRE_CHUNK_SIZE != 0:
+            raise ValueError(
+                f"action_chunk_size ({micro_k}) must be divisible by PRE_CHUNK_SIZE "
+                f"({PRE_CHUNK_SIZE})."
+            )
+        k_outer = micro_k // PRE_CHUNK_SIZE
+
+        actions = traj["action/joint_velocity"]  # [T, PRE_CHUNK_SIZE, 8]
         T = tf.shape(actions)[0]
-        K = self.action_chunk_size
 
-        # idx[t, j] = t + j for chunk position j at timestep t.
-        valid_T = T - K + 1
+        # Starting outer index t: need rows t..t+k_outer-1 => valid_T = T - k_outer + 1
+        valid_T = T - k_outer + 1
         base = tf.range(valid_T, dtype=tf.int32)[:, None]
-        offsets = tf.range(K, dtype=tf.int32)[None, :]
-        idx = base + offsets  # [valid_T, K]
+        offsets = tf.range(k_outer, dtype=tf.int32)[None, :]
+        idx = base + offsets  # [valid_T, k_outer]
 
-        action_chunks = tf.gather(actions, idx, axis=0)  # [valid_T, K, 8]
+        gathered = tf.gather(actions, idx, axis=0)  # [valid_T, k_outer, PRE_CHUNK_SIZE, 8]
+        action_chunks = tf.reshape(
+            gathered,
+            tf.stack(
+                [
+                    valid_T,
+                    tf.constant(micro_k, dtype=tf.int32),
+                    tf.constant(8, dtype=tf.int32),
+                ]
+            ),
+        )  # [valid_T, micro_k, 8]
 
-        # Keep only states that have a full K-step future chunk
+        # Post-window reward r_{t+k_outer} => slice value_target from index k_outer-1
+        vt = traj["value_target"]
+        traj["value_target"] = tf.slice(
+            vt, begin=[k_outer - 1], size=[valid_T]
+        )
+
         for k in list(traj.keys()):
+            if k == "action/joint_velocity":
+                continue
             traj[k] = traj[k][:valid_T]
 
-        traj["action/joint_velocity_chunk"] = tf.ensure_shape(action_chunks, [None, K, 8])
+        traj["action/joint_velocity_chunk"] = tf.ensure_shape(
+            action_chunks, [None, micro_k, 8]
+        )
+        del traj["action/joint_velocity"]
         return traj
-
+    
     # --------------------------------------------------------------------- #
     # Example-level transforms                                              #
     # --------------------------------------------------------------------- #
 
     def _select_language_instr(self, transition):
-        random_number = tf.random.uniform((1,), maxval=3, dtype=tf.int32)[0]
-        language_1 = transition["language_instruction1"]
-        language_2 = transition["language_instruction2"]
-        language_3 = transition["language_instruction3"]
-        
-        language = language_1
-        language = tf.where(random_number == 1, language_2, language)
-        language = tf.where(random_number == 2, language_3, language)
-
+        language = transition["language_instruction1"]
         transition["language_instruction"] = language
         del transition["language_instruction1"]
-        del transition["language_instruction2"]
-        del transition["language_instruction3"]
-
         return transition
 
     def _lang_filter_fn(self, transition):
@@ -429,22 +428,19 @@ class Dataset:
         return keep
     
     def _stack_and_reshape_images(self, transition):
+        # Single shoulder frame -> resize to (672, 560), the fixed vision input size
         shoulder = transition["shoulder_image_1"]
-        wrist = transition["wrist_image"]
-        shoulder_and_wrist = tf.concat([shoulder, wrist], axis=0)
-        shoulder_and_wrist = tf.ensure_shape(shoulder_and_wrist, [576, 512, 3])
-        shoulder_and_wrist = tf.cast(
-            tf.round(tf.image.resize(shoulder_and_wrist, (672, 560), method="bicubic")),
+        shoulder = tf.ensure_shape(shoulder, [288, 512, 3])
+        shoulder = tf.cast(
+            tf.round(tf.image.resize(shoulder, (672, 560), method="bicubic")),
             tf.uint8,
         )
-
-        transition["image"] = shoulder_and_wrist
-        del transition["wrist_image"]
+        transition["image"] = shoulder
         del transition["shoulder_image_1"]
-
         return transition
 
     ######################### Iterator ############################
 
     def iterator(self):
         return self.tf_dataset.prefetch(tf.data.AUTOTUNE).as_numpy_iterator()
+

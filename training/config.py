@@ -35,16 +35,22 @@ def get_config(config_string):
         action_norm_eps=ACTION_NORM_EPS,
     )
 
-    _ROBOARENA_PREFIX = "gs://raymond-us-west1/droid_labeled/roboarena_renamed"
+    _ROBOARENA_RAW_PREFIX = "gs://raymond-us-west1/droid/roboarena"
+    _ROBOARENA_LABEL_PREFIX = "gs://raymond-us-west1/droid_labeled/roboarena_partial_success"
     _ROBOARENA_SHARD_BASENAME = "roboarena"
-    _roboarena_shard_paths = [
-        f"{_ROBOARENA_PREFIX}/{_ROBOARENA_SHARD_BASENAME}-{i:05d}.tfrecord"
+    _roboarena_raw_shard_paths = [
+        f"{_ROBOARENA_RAW_PREFIX}/{_ROBOARENA_SHARD_BASENAME}-{i:05d}.tfrecord"
+        for i in range(40)
+    ]
+    _roboarena_label_shard_paths = [
+        f"{_ROBOARENA_LABEL_PREFIX}/{_ROBOARENA_SHARD_BASENAME}-{i:05d}.tfrecord"
         for i in range(40)
     ]
 
     roboarena_data_config = {
         **base_data_config,
-        "data_paths": [_roboarena_shard_paths],
+        "data_paths": [_roboarena_raw_shard_paths],
+        "label_data_paths": [_roboarena_label_shard_paths],
     }
 
     possible_structures = {
@@ -60,7 +66,7 @@ def get_config(config_string):
                     decay_steps=None,
                     warmup_steps=2500,
                     target_update_rate=0.9999,
-                    obs_dropout_prob=0.5, # Randomly drop out the image tokens with probability p
+                    obs_dropout_prob=0.8, # Randomly drop out the image tokens with probability p
                 ),
                 dataset_kwargs=dict(
                     **base_data_config,

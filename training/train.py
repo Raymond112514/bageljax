@@ -130,6 +130,7 @@ def main(_):
         # Create the RoboArena dataset
         roboarena_train_data = RoboArenaDataset(
             data_paths=ra_dk["data_paths"],
+            label_data_paths=ra_dk.get("label_data_paths"),
             seed=dataset_seed,
             batch_size=half_batch_size,
             shuffle_buffer_size=shuffle_robo,
@@ -160,7 +161,14 @@ def main(_):
                 axis=0,
             ),
             "distance": np.concatenate(
-                [droid_batch["distance"], robo_batch["value_target"]], axis=0
+                [droid_batch["distance"], robo_batch["distance"]], axis=0
+            ),
+            "partial_progress": np.concatenate(
+                [
+                    np.ones((droid_bsz,), dtype=np.float32),
+                    robo_batch["partial_progress"].astype(np.float32),
+                ],
+                axis=0,
             ),
             "is_roboarena": np.concatenate(
                 [
@@ -490,13 +498,11 @@ def main(_):
             # get rid of singleton dimension
             value_logits = value_logits[:, 0]
 
-            # Construct cross-entropy targets. DROID `distance` is timesteps-to-go; RoboArena `distance` is already a processed value in [0, 1] — use as-is.
+            # Construct cross-entropy targets from discounted distance-to-go,
+            # scaled by per-trajectory partial progress.
             dist_f = batch["distance"].astype(jnp.float32)
-            discounted_distances = jnp.where(
-                batch["is_roboarena"],
-                dist_f,
-                jnp.power(config["discount_factor"], dist_f),
-            )
+            progress_scale = batch["partial_progress"].astype(jnp.float32)
+            discounted_distances = jnp.power(config["discount_factor"], dist_f) * progress_scale
             # Shape (B,), float32; values suitable for bucketing (typically in [0, 1]).
             assert discounted_distances.shape == (post_llm_seq.shape[0],)
             assert discounted_distances.dtype == jnp.float32
@@ -597,6 +603,7 @@ def main(_):
                 batch = next(train_data_iter)
                 bsz = batch["image"].shape[0]
                 batch["is_roboarena"] = np.zeros((bsz,), dtype=bool)
+                batch["partial_progress"] = np.ones((bsz,), dtype=np.float32)
             batch = tokenize_and_pad(batch)
             batch = shard_data(batch)
             timer.tock("dataset")
