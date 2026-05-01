@@ -1,22 +1,17 @@
 import asyncio
 import numpy as np
 import websockets
-import tensorflow as tf
 from bageljax.utils import msgpack_numpy
 from data_sampler import TrajectoryDataSampler
 import matplotlib.pyplot as plt
 from media_saver import MediaSaver
-import imageio
 
 NUM_BUCKETS = 64
 ACTION_CHUNK_SIZE = 30  # must match training / inference_server INFERENCE_CONFIG
 # Query stride for value labeling/inference.
 QUERY_STRIDE = ACTION_CHUNK_SIZE
-# RoboArena GT rewards are pre-labeled every 10 timesteps.
-GT_REWARD_TIMESTEP_STRIDE = 10
 NUM_TRAJ_PER_TFRECORD = 20
 MAX_EXAMPLE_SCAN_PER_TFRECORD = 2000
-ROBOARENA_LABELED_PREFIX = "gs://raymond-us-west1/droid_labeled/roboarena_renamed"
 
 INFERENCE_DATA_PATHS = [
     "gs://raymond-us-west1/droid/roboarena/roboarena-00000.tfrecord",
@@ -26,8 +21,8 @@ INFERENCE_DATA_PATHS = [
     "gs://raymond-us-west1/droid/roboarena/roboarena-00043.tfrecord",
     "gs://raymond-us-west1/droid/roboarena/roboarena-00044.tfrecord",
     "gs://raymond-us-west1/droid/roboarena/roboarena-00045.tfrecord",
+    "gs://raymond-us-west1/droid/roboarena/roboarena-00046.tfrecord",
     "gs://raymond-us-west1/droid/roboarena/roboarena-00010.tfrecord",
-    "gs://raymond-us-west1/droid/roboarena/roboarena-00020.tfrecord",
     "gs://raymond-us-west1/droid/roboarena/roboarena-00030.tfrecord",
 ]
 
@@ -63,29 +58,6 @@ def plot_heatmap(logits, path):
     plt.title("Distribution over classes (time)")
     plt.savefig(path)
 
-def load_roboarena_ground_truth_buckets(shard_id, example_index, action_chunk_size, num_buckets):
-    """Load GT value targets from labeled RoboArena TFRecord and map to bucket space."""
-    if shard_id is None:
-        return None
-    labeled_path = f"{ROBOARENA_LABELED_PREFIX}/roboarena-{int(shard_id):05d}.tfrecord"
-    ds = tf.data.TFRecordDataset([labeled_path]).skip(int(example_index)).take(1)
-    try:
-        serialized_example = next(iter(ds))
-    except StopIteration:
-        return None
-
-    parsed = tf.io.parse_single_example(
-        serialized_example,
-        {"rewards": tf.io.VarLenFeature(tf.float32)},
-    )
-    rewards = tf.reshape(tf.sparse.to_dense(tf.sparse.reorder(parsed["rewards"])), [-1]).numpy()
-    if rewards.shape[0] == 0:
-        return None
-
-    # RoboArena labeled rewards are already aligned to action-chunked samples.
-    gt_buckets = np.clip(rewards * float(num_buckets), 0.0, float(num_buckets - 1))
-    return gt_buckets.astype(np.float32)
-
 async def main():
     uri = "ws://localhost:8000"
     packer = msgpack_numpy.Packer()
@@ -118,7 +90,6 @@ async def main():
                 "utf-8"
             ).lower()
             file_index = traj.as_dict()["tfrecord_shard_id"]
-            tfrecord_example_index = traj.as_dict()["tfrecord_example_index"]
             print_green(
                 f"File index: {file_index}, trajectory {num_collected}/{NUM_TRAJ_PER_TFRECORD}"
             )
@@ -182,36 +153,14 @@ async def main():
             all_logits = np.asarray(all_logits)
             pred_values = np.asarray(all_values, dtype=np.float32)
             queried_images = d["image"][queried_start_indices]
-            gt_values = load_roboarena_ground_truth_buckets(
-                shard_id=file_index,
-                example_index=tfrecord_example_index,
-                action_chunk_size=K,
-                num_buckets=NUM_BUCKETS,
-            )
             print(f"Pred values shape: {pred_values.shape}")
-            print(f"GT values shape: {gt_values.shape}")
-            print("-"*50)
-            queried_gt_values = None
-            if gt_values is not None:
-                qidx = np.asarray(queried_start_indices, dtype=np.int32)
-                max_q = int(np.max(qidx)) if qidx.size > 0 else -1
-                if gt_values.shape[0] > max_q:
-                    # GT indexed on timestep domain.
-                    queried_gt_values = gt_values[qidx]
-                else:
-                    # GT indexed on pre-labeled domain (one label per 10 timesteps).
-                    chunk_idx = qidx // int(GT_REWARD_TIMESTEP_STRIDE)
-                    max_c = int(np.max(chunk_idx)) if chunk_idx.size > 0 else -1
-                    if gt_values.shape[0] > max_c:
-                        queried_gt_values = gt_values[chunk_idx]
-
+            print("-" * 50)
             media_saver.save_value_plot(
                 queried_images,
                 pred_values,
                 filename="value_function.mp4",
                 title=language_instruction,
                 stride=QUERY_STRIDE,
-                ground_truth_values=queried_gt_values,
             )
             plot_heatmap(
                 all_logits,

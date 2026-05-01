@@ -35,20 +35,19 @@ from bageljax.model.mixture_of_transformers import MixtureOfTransformers
 
 def get_checkpoint_suffix(path: str) -> str:
     parts = path.rstrip("/").split("/")
-    if len(parts) >= 2:
-        return "/".join(parts[-2:])
     return parts[-1]
 
 # --------------- all configs/hyperparams for inference are stored here, modify at will ---------------
 INFERENCE_CONFIG = {
     "seed": 0,
-    "checkpoint_load_dir": "gs://raymond-us-west1/value_function_logs/roboarena_dropout0.2/00040000",
-    "reduced_checkpoint_save_dir": "gs://raymond-us-west1",
+    "checkpoint_load_dir": "gs://raymond-us-west1/value_function_logs/value_function/value_function_20260430_084819/00005000",
+    "reduced_checkpoint_save_dir": "gs://raymond-us-west1/minimized_train_state/roboarena_distribution_dropout0.5",
 }
 INFERENCE_CONFIG["reduced_checkpoint_save_dir"] = (
     f"{INFERENCE_CONFIG['reduced_checkpoint_save_dir']}/"
     f"{get_checkpoint_suffix(INFERENCE_CONFIG['checkpoint_load_dir'])}"
 )
+print(f"Reduced checkpoint save dir: {INFERENCE_CONFIG['reduced_checkpoint_save_dir']}")
 
 # Initialize rng from config seed
 rng = jax.random.PRNGKey(INFERENCE_CONFIG["seed"])
